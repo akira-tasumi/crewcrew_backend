@@ -1,0 +1,35 @@
+# Core Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# Database
+sqlalchemy==2.0.36
+
+# AWS
+boto3==1.35.86
+
+# Environment
+python-dotenv==1.0.1
+
+# File Upload
+python-multipart==0.0.19
+
+# HTTP Requests
+requests==2.32.3
+
+# Web Scraping / Content Extraction
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# PDF Processing
+pypdf==5.1.0
+
+# Image Processing
+pillow==11.0.0
+rembg==2.0.60
+onnxruntime==1.17.1
+
+# YouTube Transcript
+youtube-transcript-api==0.6.3

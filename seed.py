@@ -1,0 +1,344 @@
+from sqlalchemy.orm import Session
+
+from models import Crew, Gadget, Skill
+
+# ============================================================
+# Roles (役割) - stats配分の定義
+# ============================================================
+ROLES = {
+    "Sales": {
+        "label": "営業",
+        "stats_weight": {"speed": 1.3, "creativity": 0.9, "mood": 0.8},  # SPEED重視
+        "primary_skills": ["Negotiation", "Presentation"],
+    },
+    "Marketer": {
+        "label": "マーケター",
+        "stats_weight": {"speed": 0.9, "creativity": 1.3, "mood": 0.8},  # CREATIVITY重視
+        "primary_skills": ["Copywriting", "Ideation"],
+    },
+    "Engineer": {
+        "label": "エンジニア",
+        "stats_weight": {"speed": 1.0, "creativity": 1.0, "mood": 1.0},  # Balance
+        "primary_skills": ["Debugging", "Logical Thinking"],
+    },
+    "Designer": {
+        "label": "デザイナー",
+        "stats_weight": {"speed": 0.7, "creativity": 1.5, "mood": 0.8},  # CREATIVITY特化
+        "primary_skills": ["Design Thinking", "Ideation"],
+    },
+    "Admin": {
+        "label": "事務",
+        "stats_weight": {"speed": 0.9, "creativity": 0.8, "mood": 1.3},  # MOOD重視
+        "primary_skills": ["Time Management", "Multitasking"],
+    },
+    "Manager": {
+        "label": "マネージャー",
+        "stats_weight": {"speed": 1.1, "creativity": 1.1, "mood": 1.1},  # All Rounder
+        "primary_skills": ["Presentation", "Negotiation", "Time Management"],
+    },
+}
+
+
+# ============================================================
+# Personalities (性格) - 口調・振る舞いの定義
+# ============================================================
+PERSONALITIES = {
+    "Hot-blooded": {
+        "label": "熱血",
+        "description": "情熱的で行動力がある。語尾に「〜だぜ！」「〜するぜ！」を使う。",
+        "emoji": "🔥",
+        "tone": "熱血で情熱的。ポジティブで力強い言葉を使う。",
+    },
+    "Cool": {
+        "label": "クール",
+        "description": "冷静沈着で感情をあまり表に出さない。「...」を多用する。",
+        "emoji": "❄️",
+        "tone": "クールで寡黙。短い文で論理的に話す。",
+    },
+    "Gentle": {
+        "label": "おだやか",
+        "description": "穏やかで優しい。丁寧な敬語を使い、相手を気遣う。",
+        "emoji": "🌸",
+        "tone": "穏やかで優しい。丁寧な敬語を使う。",
+    },
+    "Serious": {
+        "label": "真面目",
+        "description": "真面目で責任感が強い。論理的で正確な表現を好む。",
+        "emoji": "📚",
+        "tone": "真面目で責任感が強い。断定的な表現を使う。",
+    },
+    "Playful": {
+        "label": "わんぱく",
+        "description": "明るく元気で好奇心旺盛。「〜だよ！」「〜じゃん！」を使う。",
+        "emoji": "☀️",
+        "tone": "明るくフレンドリー。カジュアルな表現を使う。",
+    },
+    "Cautious": {
+        "label": "慎重",
+        "description": "慎重で用心深い。リスクを考慮した発言をする。",
+        "emoji": "🔍",
+        "tone": "慎重で分析的。「〜かもしれません」「念のため」を多用。",
+    },
+}
+
+
+# ============================================================
+# Skills (スキル) マスタデータ - 日本語表記
+# ============================================================
+INITIAL_SKILLS = [
+    # Intelligence (知性系)
+    {
+        "name": "データ分析",
+        "skill_type": "Intelligence",
+        "description": "データを分析し、洞察を導き出す能力",
+        "bonus_effect": "creativity",
+    },
+    {
+        "name": "論理的思考",
+        "skill_type": "Intelligence",
+        "description": "論理的に物事を考え、問題を解決する能力",
+        "bonus_effect": "speed",
+    },
+    {
+        "name": "情報収集",
+        "skill_type": "Intelligence",
+        "description": "必要な情報を効率的に収集する能力",
+        "bonus_effect": "speed",
+    },
+    # Creative (創造系)
+    {
+        "name": "ライティング",
+        "skill_type": "Creative",
+        "description": "魅力的な文章を書く能力",
+        "bonus_effect": "creativity",
+    },
+    {
+        "name": "発想力",
+        "skill_type": "Creative",
+        "description": "新しいアイデアを生み出す能力",
+        "bonus_effect": "creativity",
+    },
+    {
+        "name": "デザイン思考",
+        "skill_type": "Creative",
+        "description": "デザイン思考で問題を解決する能力",
+        "bonus_effect": "creativity",
+    },
+    # Communication (コミュニケーション系)
+    {
+        "name": "交渉力",
+        "skill_type": "Communication",
+        "description": "交渉を有利に進める能力",
+        "bonus_effect": "mood",
+    },
+    {
+        "name": "おもてなし",
+        "skill_type": "Communication",
+        "description": "おもてなしの心で接客する能力",
+        "bonus_effect": "mood",
+    },
+    {
+        "name": "プレゼン力",
+        "skill_type": "Communication",
+        "description": "プレゼンテーションで人を惹きつける能力",
+        "bonus_effect": "mood",
+    },
+    # Execution (実行系)
+    {
+        "name": "マルチタスク",
+        "skill_type": "Execution",
+        "description": "複数のタスクを同時に処理する能力",
+        "bonus_effect": "speed",
+    },
+    {
+        "name": "デバッグ",
+        "skill_type": "Execution",
+        "description": "バグを発見し修正する能力",
+        "bonus_effect": "speed",
+    },
+    {
+        "name": "時間管理",
+        "skill_type": "Execution",
+        "description": "時間を効率的に管理する能力",
+        "bonus_effect": "speed",
+    },
+]
+
+
+# ============================================================
+# 初期クルー（既存データ）- 新しい役割・性格に対応
+# ============================================================
+INITIAL_CREWS = [
+    {
+        "name": "フレイミー",
+        "role": "Sales",
+        "level": 12,
+        "exp": 1200,
+        "image_url": "/images/crews/monster_1.png",
+        "personality": "Hot-blooded",
+    },
+    {
+        "name": "アクアン",
+        "role": "Admin",
+        "level": 8,
+        "exp": 640,
+        "image_url": "/images/crews/monster_2.png",
+        "personality": "Gentle",
+    },
+    {
+        "name": "ロッキー",
+        "role": "Engineer",
+        "level": 15,
+        "exp": 2250,
+        "image_url": "/images/crews/monster_3.png",
+        "personality": "Serious",
+    },
+    {
+        "name": "ウィンディ",
+        "role": "Marketer",
+        "level": 10,
+        "exp": 900,
+        "image_url": "/images/crews/monster_4.png",
+        "personality": "Playful",
+    },
+    {
+        "name": "スパーキー",
+        "role": "Designer",
+        "level": 7,
+        "exp": 490,
+        "image_url": "/images/crews/monster_5.png",
+        "personality": "Playful",
+    },
+    {
+        "name": "シャドウ",
+        "role": "Manager",
+        "level": 20,
+        "exp": 4000,
+        "image_url": "/images/crews/monster_6.png",
+        "personality": "Cool",
+    },
+]
+
+
+# ============================================================
+# ガジェットマスタデータ（スキルタイプ連動）
+# effect_type: Intelligence / Creative / Communication / Execution
+# ============================================================
+INITIAL_GADGETS = [
+    {
+        "name": "データ分析ツールキット",
+        "description": "高度なデータ分析能力を身につけ、洞察力がアップ",
+        "icon": "📊",
+        "effect_type": "Intelligence",
+        "base_effect_value": 10,
+        "base_cost": 500,
+    },
+    {
+        "name": "Python専門書",
+        "description": "論理的思考力を養い、知性系スキルを強化",
+        "icon": "📘",
+        "effect_type": "Intelligence",
+        "base_effect_value": 12,
+        "base_cost": 600,
+    },
+    {
+        "name": "デザインタブレット",
+        "description": "クリエイティブな発想を形にする道具",
+        "icon": "🎨",
+        "effect_type": "Creative",
+        "base_effect_value": 15,
+        "base_cost": 800,
+    },
+    {
+        "name": "AIアシスタントツール",
+        "description": "アイデア発想をサポートし、創造系スキルを強化",
+        "icon": "🤖",
+        "effect_type": "Creative",
+        "base_effect_value": 20,
+        "base_cost": 1200,
+    },
+    {
+        "name": "プレゼンリモコン",
+        "description": "プレゼンスキルを向上させ、コミュニケーション力アップ",
+        "icon": "🎤",
+        "effect_type": "Communication",
+        "base_effect_value": 12,
+        "base_cost": 700,
+    },
+    {
+        "name": "ノイズキャンセリングヘッドホン",
+        "description": "雑音をシャットアウトし、交渉に集中できる",
+        "icon": "🎧",
+        "effect_type": "Communication",
+        "base_effect_value": 15,
+        "base_cost": 900,
+    },
+    {
+        "name": "高性能ゲーミングマウス",
+        "description": "超高速レスポンスで作業効率を大幅にアップ",
+        "icon": "🖱️",
+        "effect_type": "Execution",
+        "base_effect_value": 15,
+        "base_cost": 800,
+    },
+    {
+        "name": "メカニカルキーボード",
+        "description": "打鍵感抜群で実行系スキルが向上",
+        "icon": "⌨️",
+        "effect_type": "Execution",
+        "base_effect_value": 12,
+        "base_cost": 700,
+    },
+]
+
+
+# ============================================================
+# Seed関数
+# ============================================================
+def seed_skills(db: Session) -> None:
+    """スキルマスタデータを投入"""
+    existing_count = db.query(Skill).count()
+    if existing_count > 0:
+        return
+
+    for skill_data in INITIAL_SKILLS:
+        skill = Skill(**skill_data)
+        db.add(skill)
+
+    db.commit()
+    print(f"✓ {len(INITIAL_SKILLS)} skills seeded")
+
+
+def seed_crews(db: Session) -> None:
+    """クルーの初期データを投入"""
+    existing_count = db.query(Crew).count()
+    if existing_count > 0:
+        return
+
+    for crew_data in INITIAL_CREWS:
+        crew = Crew(**crew_data)
+        db.add(crew)
+
+    db.commit()
+    print(f"✓ {len(INITIAL_CREWS)} crews seeded")
+
+
+def seed_gadgets(db: Session) -> None:
+    """ガジェットの初期データを投入"""
+    existing_count = db.query(Gadget).count()
+    if existing_count > 0:
+        return
+
+    for gadget_data in INITIAL_GADGETS:
+        gadget = Gadget(**gadget_data)
+        db.add(gadget)
+
+    db.commit()
+    print(f"✓ {len(INITIAL_GADGETS)} gadgets seeded")
+
+
+def seed_all(db: Session) -> None:
+    """全ての初期データを投入"""
+    seed_skills(db)
+    seed_crews(db)
+    seed_gadgets(db)

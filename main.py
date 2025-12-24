@@ -1,0 +1,3050 @@
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from database import Base, SessionLocal, engine, get_db
+from models import Crew as CrewModel, TaskLog, User as UserModel, UnlockedPersonality, DailyLog, Gadget, CrewGadget, Skill, CrewSkill, Project, ProjectTask, ProjectInput
+from seed import seed_crews, seed_gadgets, seed_skills, ROLES, PERSONALITIES
+from services.bedrock_service import execute_task_with_crew, generate_greeting, route_task_with_partner, generate_whimsical_talk, generate_labor_words
+from services.image_generation_service import generate_crew_image_with_fallback, evolve_crew_image
+from services.youtube import get_transcript_from_url
+from services.web_reader import fetch_web_content
+from services.pdf_reader import extract_text_from_pdf
+
+load_dotenv()
+
+# CORS設定: 環境変数から許可リストを取得（デフォルトは全許可）
+def get_cors_origins() -> list[str]:
+    """
+    BACKEND_CORS_ORIGINS 環境変数からCORS許可リストを取得する
+    カンマ区切りで複数指定可能（例: "http://localhost:3000,https://example.com"）
+    設定がない場合は ["*"] を返す（全許可）
+    """
+    cors_origins = os.getenv("BACKEND_CORS_ORIGINS")
+    if cors_origins:
+        return [origin.strip() for origin in cors_origins.split(",")]
+    return ["*"]
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+
+    logger.info("Seeding initial data...")
+    db = SessionLocal()
+    try:
+        seed_skills(db)
+        seed_crews(db)
+        seed_gadgets(db)
+        # デフォルトユーザーを作成（存在しない場合）
+        if not db.query(UserModel).first():
+            default_user = UserModel()
+            db.add(default_user)
+            db.commit()
+            logger.info("Created default user")
+    finally:
+        db.close()
+
+    logger.info("Kurukuru Backend server started successfully!")
+    yield
+
+
+app = FastAPI(title="Kurukuru Backend", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- Response Models ---
+
+
+class UserResponse(BaseModel):
+    id: int
+    company_name: str
+    coin: int
+    ruby: int
+    rank: str
+    office_level: int = 1
+    background_theme: str = "modern"
+
+    model_config = {"from_attributes": True}
+
+
+class WhimsicalTalkRequest(BaseModel):
+    time_of_day: str  # morning, afternoon, evening, night
+
+
+class WhimsicalTalkResponse(BaseModel):
+    success: bool
+    talk: str | None = None
+    partner_name: str | None = None
+    partner_image: str | None = None
+    error: str | None = None
+
+
+class CrewResponse(BaseModel):
+    id: int
+    name: str
+    role: str
+    level: int
+    exp: int
+    image: str
+    personality: str | None = None
+    greeting: str | None = None  # 入社挨拶（作成時のみ）
+    is_partner: bool = False
+    rarity: int = 1  # レアリティ（★1〜★5）
+
+    model_config = {"from_attributes": True}
+
+
+class PartnerResponse(BaseModel):
+    id: int
+    name: str
+    role: str
+    level: int
+    image: str
+    personality: str | None = None
+    greeting: str  # 相棒の挨拶メッセージ
+
+    model_config = {"from_attributes": True}
+
+
+class ExecuteTaskRequest(BaseModel):
+    crew_id: int
+    task: str
+
+
+class ExecuteTaskResponse(BaseModel):
+    success: bool
+    result: str | None  # AIが生成したテキストをそのまま返す
+    crew_name: str
+    crew_id: int
+    error: str | None = None
+    # EXP/レベル関連
+    old_level: int | None = None  # レベルアップ前のレベル
+    new_level: int | None = None  # レベルアップ後のレベル
+    new_exp: int | None = None    # 新しいEXP値
+    exp_gained: int | None = None # 獲得したEXP
+    leveled_up: bool = False      # レベルアップしたかどうか
+    # コイン報酬
+    coin_gained: int | None = None  # 獲得コイン
+    new_coin: int | None = None     # 新しいコイン残高
+    # ルビー報酬（レベルアップ時）
+    ruby_gained: int | None = None  # 獲得ルビー
+    new_ruby: int | None = None     # 新しいルビー残高
+
+
+class RouteTaskRequest(BaseModel):
+    task: str
+
+
+class RouteTaskResponse(BaseModel):
+    success: bool
+    selected_crew_id: int
+    selected_crew_name: str
+    partner_comment: str
+    partner_name: str
+    error: str | None = None
+
+
+class SkillInfo(BaseModel):
+    name: str
+    level: int
+    skill_type: str
+    description: str
+    bonus_effect: str
+    slot_type: str  # primary/sub/random
+
+
+class StatsInfo(BaseModel):
+    speed: int
+    creativity: int
+    mood: int
+
+
+class ScoutedCrewResponse(BaseModel):
+    id: int
+    name: str
+    role: str
+    role_label: str  # 日本語ラベル
+    level: int
+    exp: int
+    image: str
+    personality: str
+    personality_label: str  # 日本語ラベル
+    rarity: int
+    stats: StatsInfo
+    skills: list[SkillInfo]
+
+    model_config = {"from_attributes": True}
+
+
+class ScoutResponse(BaseModel):
+    success: bool
+    crew: ScoutedCrewResponse | None = None
+    greeting: str | None = None
+    error: str | None = None
+    new_coin: int | None = None
+    rarity: int | None = None  # レアリティ（★1〜★5）
+    partner_reaction: str | None = None  # 相棒の反応（★4以上で特別コメント）
+
+
+class PersonalityInfo(BaseModel):
+    key: str
+    name: str
+    description: str
+    cost: int  # ルビーコスト（0=無料）
+    is_unlocked: bool
+
+
+class PersonalitiesResponse(BaseModel):
+    free_personalities: list[PersonalityInfo]
+    premium_personalities: list[PersonalityInfo]
+
+
+class UnlockPersonalityRequest(BaseModel):
+    personality_key: str
+
+
+class UnlockPersonalityResponse(BaseModel):
+    success: bool
+    error: str | None = None
+    new_ruby: int | None = None
+
+
+class StampInfo(BaseModel):
+    date: str  # YYYY-MM-DD
+    has_stamp: bool
+
+
+class DailyReportResponse(BaseModel):
+    success: bool
+    date: str  # YYYY-MM-DD
+    task_count: int
+    earned_coins: int
+    login_bonus_given: bool  # 今回ログインボーナスを付与したか
+    login_bonus_amount: int  # ログインボーナス額
+    stamps: list[StampInfo]  # 過去7日分のスタンプ情報
+    consecutive_days: int  # 連続ログイン日数
+    labor_words: str  # 相棒の労いの言葉
+    partner_name: str | None = None
+    partner_image: str | None = None
+    new_coin: int | None = None  # 新しいコイン残高
+    error: str | None = None
+
+
+class EvolveCrewResponse(BaseModel):
+    success: bool
+    crew: CrewResponse | None = None
+    old_image: str | None = None  # 進化前の画像パス
+    new_image: str | None = None  # 進化後の画像パス
+    old_role: str | None = None   # 進化前の役職
+    new_role: str | None = None   # 進化後の役職
+    error: str | None = None
+    new_ruby: int | None = None   # 新しいルビー残高
+
+
+class CreateCrewRequest(BaseModel):
+    name: str
+    role: str
+    personality_key: str  # 性格のキー（熱血、おだやか等）
+    image: str | None = None  # オプション（デフォルト画像を使用）
+
+
+class UpdateCrewRequest(BaseModel):
+    name: str | None = None
+    role: str | None = None
+    personality: str | None = None
+    image: str | None = None
+
+
+# --- Endpoints ---
+
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok", "message": "Hello from Kurukuru Backend!"}
+
+
+@app.get("/api/crews")
+async def get_crews(db: Session = Depends(get_db)) -> list[CrewResponse]:
+    crews = db.query(CrewModel).order_by(CrewModel.id.desc()).all()
+    return [
+        CrewResponse(
+            id=crew.id,
+            name=crew.name,
+            role=crew.role,
+            level=crew.level,
+            exp=crew.exp,
+            image=crew.image_url,
+            personality=crew.personality,
+            is_partner=crew.is_partner,
+            rarity=crew.rarity,
+        )
+        for crew in crews
+    ]
+
+
+@app.get("/api/crews/{crew_id}/skills")
+async def get_crew_skills(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> list[SkillInfo]:
+    """
+    指定したクルーのスキル一覧を取得
+    """
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    crew_skills = db.query(CrewSkill).filter(CrewSkill.crew_id == crew_id).all()
+
+    return [
+        SkillInfo(
+            name=cs.skill.name,
+            level=cs.level,
+            skill_type=cs.skill.skill_type,
+            description=cs.skill.description,
+            bonus_effect=cs.skill.bonus_effect,
+            slot_type=cs.slot_type,
+        )
+        for cs in crew_skills
+    ]
+
+
+@app.get("/api/crews/{crew_id}/stats")
+async def get_crew_stats(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> StatsInfo:
+    """
+    指定したクルーのステータスを取得（役割とレベルから計算）
+    """
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    stats = calculate_base_stats(crew.role, crew.level)
+    return StatsInfo(**stats)
+
+
+@app.post("/api/crews/{crew_id}/assign-skills")
+async def assign_skills_to_existing_crew(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> list[SkillInfo]:
+    """
+    スキルを持たない既存クルーにスキルを付与する
+    """
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # 既にスキルを持っているか確認
+    existing_skills = db.query(CrewSkill).filter(CrewSkill.crew_id == crew_id).count()
+    if existing_skills > 0:
+        # 既存スキルを返す
+        crew_skills = db.query(CrewSkill).filter(CrewSkill.crew_id == crew_id).all()
+        return [
+            SkillInfo(
+                name=cs.skill.name,
+                level=cs.level,
+                skill_type=cs.skill.skill_type,
+                description=cs.skill.description,
+                bonus_effect=cs.skill.bonus_effect,
+                slot_type=cs.slot_type,
+            )
+            for cs in crew_skills
+        ]
+
+    # スキルを付与
+    assigned_skills = assign_skills_to_crew(db, crew_id, crew.role)
+    db.commit()
+
+    logger.info(f"Assigned skills to existing crew: {crew.name} (ID: {crew_id})")
+    return assigned_skills
+
+
+@app.post("/api/crews/assign-skills-all")
+async def assign_skills_to_all_crews(
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    スキルを持たない全クルーにスキルを付与する（初期化用）
+    """
+    crews = db.query(CrewModel).all()
+    assigned_count = 0
+
+    for crew in crews:
+        existing_skills = db.query(CrewSkill).filter(CrewSkill.crew_id == crew.id).count()
+        if existing_skills == 0:
+            assign_skills_to_crew(db, crew.id, crew.role)
+            assigned_count += 1
+            logger.info(f"Assigned skills to: {crew.name} (ID: {crew.id})")
+
+    db.commit()
+    return {
+        "success": True,
+        "total_crews": len(crews),
+        "assigned_count": assigned_count,
+        "message": f"{assigned_count} crews received skills",
+    }
+
+
+@app.post("/api/crews")
+async def create_crew(
+    request: CreateCrewRequest,
+    db: Session = Depends(get_db),
+) -> CrewResponse:
+    """
+    新しいクルーを作成する（500コイン消費）
+
+    - name: クルーの名前
+    - role: クルーの役割
+    - personality_key: 性格のキー（熱血、おだやか等）
+    - image: 画像URL（オプション、指定がなければAI生成）
+
+    画像が指定されていない場合、Bedrock Nova Canvas で
+    ベース画像からバリエーションを生成し、背景透過して保存する。
+    """
+    CREATE_COST = 500
+
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # コイン残高を確認
+    if user.coin < CREATE_COST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"コインが足りません（必要: {CREATE_COST}、現在: {user.coin}）"
+        )
+
+    # 性格の検証
+    personality_key = request.personality_key
+    personality = None
+
+    # 無料性格をチェック
+    if personality_key in FREE_PERSONALITIES:
+        personality = FREE_PERSONALITIES[personality_key]
+    # プレミアム性格をチェック
+    elif personality_key in PREMIUM_PERSONALITIES:
+        # アンロック済みかチェック
+        unlocked = db.query(UnlockedPersonality).filter(
+            UnlockedPersonality.user_id == user.id,
+            UnlockedPersonality.personality_key == personality_key
+        ).first()
+        if not unlocked:
+            raise HTTPException(
+                status_code=400,
+                detail=f"性格「{personality_key}」はアンロックされていません"
+            )
+        personality = PREMIUM_PERSONALITIES[personality_key]["description"]
+    else:
+        raise HTTPException(status_code=400, detail=f"不明な性格: {personality_key}")
+
+    # コインを消費
+    user.coin -= CREATE_COST
+
+    # 画像の決定：指定があればそれを使用、なければAI生成
+    if request.image:
+        image_url = request.image
+        logger.info(f"Using specified image: {image_url}")
+    else:
+        # Nova Canvas で画像を生成（失敗時はデフォルト画像）
+        logger.info(f"Generating image for crew: {request.name}")
+        image_url = await generate_crew_image_with_fallback(request.name)
+        logger.info(f"Generated image: {image_url}")
+
+    new_crew = CrewModel(
+        name=request.name,
+        role=request.role,
+        personality=personality,
+        image_url=image_url,
+        level=1,
+        exp=0,
+        rarity=1,  # 自由作成は★1固定
+    )
+    db.add(new_crew)
+    db.commit()
+    db.refresh(new_crew)
+
+    logger.info(f"Created new crew: {new_crew.name} (ID: {new_crew.id})")
+
+    # 入社挨拶を生成
+    greeting = await generate_greeting(
+        crew_name=request.name,
+        crew_role=request.role,
+        personality=personality,
+    )
+
+    return CrewResponse(
+        id=new_crew.id,
+        name=new_crew.name,
+        role=new_crew.role,
+        level=new_crew.level,
+        exp=new_crew.exp,
+        image=new_crew.image_url,
+        personality=new_crew.personality,
+        greeting=greeting,
+        rarity=new_crew.rarity,
+    )
+
+
+@app.put("/api/crews/{crew_id}")
+async def update_crew(
+    crew_id: int,
+    request: UpdateCrewRequest,
+    db: Session = Depends(get_db),
+) -> CrewResponse:
+    """
+    クルーを編集する
+
+    - crew_id: 編集するクルーのID
+    - name, role, personality, image: 更新するフィールド（指定されたもののみ更新）
+    """
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # 指定されたフィールドのみ更新
+    if request.name is not None:
+        crew.name = request.name
+    if request.role is not None:
+        crew.role = request.role
+    if request.personality is not None:
+        crew.personality = request.personality
+    if request.image is not None:
+        crew.image_url = request.image
+
+    db.commit()
+    db.refresh(crew)
+
+    logger.info(f"Updated crew: {crew.name} (ID: {crew.id})")
+
+    return CrewResponse(
+        id=crew.id,
+        name=crew.name,
+        role=crew.role,
+        level=crew.level,
+        exp=crew.exp,
+        image=crew.image_url,
+        personality=crew.personality,
+    )
+
+
+@app.delete("/api/crews/{crew_id}")
+async def delete_crew(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    クルーを削除する
+
+    - crew_id: 削除するクルーのID
+    """
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    crew_name = crew.name
+    db.delete(crew)
+    db.commit()
+
+    logger.info(f"Deleted crew: {crew_name} (ID: {crew_id})")
+
+    return {"success": True, "message": f"Crew '{crew_name}' deleted successfully"}
+
+
+@app.get("/api/user")
+async def get_user(db: Session = Depends(get_db)) -> UserResponse:
+    """
+    現在のユーザー情報を取得
+    """
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserResponse(
+        id=user.id,
+        company_name=user.company_name,
+        coin=user.coin,
+        ruby=user.ruby,
+        rank=user.rank,
+    )
+
+
+@app.post("/api/user/god-mode")
+async def activate_god_mode(db: Session = Depends(get_db)):
+    """
+    デバッグ用: God Modeを発動してコインとルビーを大量付与
+    """
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.coin += 10000
+    user.ruby += 100
+    db.commit()
+    db.refresh(user)
+
+    logger.info(f"GOD MODE ACTIVATED! User now has {user.coin} coins and {user.ruby} rubies")
+
+    return {
+        "success": True,
+        "message": "DEBUG MODE ACTIVATED: You are rich now!",
+        "coin": user.coin,
+        "ruby": user.ruby,
+    }
+
+
+@app.get("/api/partner")
+async def get_partner(db: Session = Depends(get_db)) -> PartnerResponse | None:
+    """
+    現在の相棒クルーを取得（挨拶メッセージ付き）
+    """
+    partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+    if not partner:
+        return None
+
+    # 固定のフォールバック挨拶を使用（API呼び出しを避けてレスポンスを高速化）
+    fallback_greetings = {
+        "フレイミー": "よっしゃ！今日も燃えていこうぜ！🔥",
+        "アクアン": "いつもお疲れ様でございます。今日も一緒に頑張りましょう✨",
+        "ロッキー": "...準備は万端だ。今日も確実に任務を遂行しよう。",
+        "ウィンディ": "やっほー♪ 今日も楽しくやっていこ〜！✨",
+        "スパーキー": "おはようっす！今日も新しい発見があるといいっすね！⚡",
+        "シャドウ": "...今日も、確実にこなしていくぞ...",
+    }
+    greeting = fallback_greetings.get(
+        partner.name,
+        f"今日も一緒に頑張りましょう！ - {partner.name}"
+    )
+
+    return PartnerResponse(
+        id=partner.id,
+        name=partner.name,
+        role=partner.role,
+        level=partner.level,
+        image=partner.image_url,
+        personality=partner.personality,
+        greeting=greeting,
+    )
+
+
+@app.get("/api/crews/{crew_id}/logs")
+async def get_crew_logs(
+    crew_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    指定したクルーのタスク履歴を取得
+    """
+    # クルーが存在するか確認
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # タスクログを取得（新しい順）
+    logs = (
+        db.query(TaskLog)
+        .filter(TaskLog.crew_id == crew_id)
+        .order_by(TaskLog.created_at.desc())
+        .limit(50)
+        .all()
+    )
+
+    return [
+        {
+            "id": log.id,
+            "task": log.task,
+            "result": log.result,
+            "status": log.status,
+            "exp_earned": log.exp_earned,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+            "completed_at": log.completed_at.isoformat() if log.completed_at else None,
+        }
+        for log in logs
+    ]
+
+
+@app.post("/api/crews/{crew_id}/set-partner")
+async def set_partner(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> CrewResponse:
+    """
+    指定したクルーを相棒に設定する
+
+    - crew_id: 相棒にするクルーのID
+    - 他のクルーのis_partnerはすべてFalseにする
+    """
+    # 指定されたクルーを取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # 全クルーのis_partnerをFalseに
+    db.query(CrewModel).update({CrewModel.is_partner: False})
+
+    # 指定されたクルーをTrueに
+    crew.is_partner = True
+    db.commit()
+    db.refresh(crew)
+
+    logger.info(f"Set partner: {crew.name} (ID: {crew.id})")
+
+    return CrewResponse(
+        id=crew.id,
+        name=crew.name,
+        role=crew.role,
+        level=crew.level,
+        exp=crew.exp,
+        image=crew.image_url,
+        personality=crew.personality,
+        is_partner=crew.is_partner,
+    )
+
+
+@app.post("/api/execute-task")
+async def execute_task(
+    request: ExecuteTaskRequest,
+    db: Session = Depends(get_db),
+) -> ExecuteTaskResponse:
+    """
+    クルーにタスクを実行させる
+
+    - crew_id: タスクを実行するクルーのID
+    - task: 実行するタスクの内容
+    """
+    # クルーをDBから取得
+    crew = db.query(CrewModel).filter(CrewModel.id == request.crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # デフォルトの性格設定
+    personality = crew.personality or "真面目で丁寧な対応を心がける。"
+
+    # Bedrock APIでタスクを実行
+    logger.info(f"Executing task with Bedrock: crew={crew.name}, personality={personality[:20]}...")
+    result = await execute_task_with_crew(
+        crew_name=crew.name,
+        crew_role=crew.role,
+        personality=personality,
+        task=request.task,
+    )
+
+    # EXP/レベル情報
+    exp_gained = 0
+    old_level = crew.level
+    new_exp = crew.exp
+    new_level = crew.level
+    leveled_up = False
+
+    # コイン報酬
+    coin_gained = 0
+    new_coin = 0
+
+    # ルビー報酬（レベルアップ時）
+    ruby_gained = 0
+    new_ruby = 0
+
+    # 成功時は経験値を加算 & TaskLogを保存 & コイン付与
+    if result["success"]:
+        exp_gained = 15  # +15 EXP（固定）
+        crew.exp += exp_gained
+
+        # レベルアップ判定（100 EXP で 1 レベルアップ）
+        # 安全策: 1回のタスクで最大1レベルまで（余剰EXPは次回に持ち越し）
+        if crew.exp >= 100:
+            crew.exp -= 100
+            crew.level += 1
+
+        new_exp = crew.exp
+        new_level = crew.level
+        leveled_up = crew.level > old_level
+
+        # コイン報酬（50コイン）
+        coin_gained = 50
+        user = db.query(UserModel).first()
+        if user:
+            user.coin += coin_gained
+            new_coin = user.coin
+            logger.info(f"Added {coin_gained} coins to user. New balance: {new_coin}")
+
+            # レベルアップ時はルビーを5個付与 + スキルレベルアップ
+            if leveled_up:
+                ruby_gained = 5
+                user.ruby += ruby_gained
+                new_ruby = user.ruby
+                logger.info(f"Level up bonus! Added {ruby_gained} rubies. New balance: {new_ruby}")
+
+                # スキルレベルアップ（ランダムで1つ選んでレベルアップ）
+                import random
+                crew_skills = db.query(CrewSkill).filter(CrewSkill.crew_id == crew.id).all()
+                if crew_skills:
+                    # レベル10未満のスキルからランダムで1つ選ぶ
+                    upgradable_skills = [s for s in crew_skills if s.level < 10]
+                    if upgradable_skills:
+                        skill_to_upgrade = random.choice(upgradable_skills)
+                        skill_to_upgrade.level += 1
+                        logger.info(f"Skill level up! {skill_to_upgrade.skill.name} -> Lv.{skill_to_upgrade.level}")
+
+        # TaskLogを保存
+        task_log = TaskLog(
+            crew_id=crew.id,
+            user_input=request.task,
+            ai_response=result["result"] or "",
+            exp_gained=exp_gained,
+        )
+        db.add(task_log)
+
+        db.commit()
+        logger.info(
+            f"Added {exp_gained} EXP to {crew.name}. "
+            f"Level: {old_level} -> {new_level}, EXP: {new_exp}, LeveledUp: {leveled_up}"
+        )
+
+    return ExecuteTaskResponse(
+        success=result["success"],
+        result=result["result"],
+        crew_name=crew.name,
+        crew_id=crew.id,
+        error=result["error"],
+        old_level=old_level,
+        new_level=new_level,
+        new_exp=new_exp,
+        exp_gained=exp_gained,
+        leveled_up=leveled_up,
+        coin_gained=coin_gained if result["success"] else None,
+        new_coin=new_coin if result["success"] else None,
+        ruby_gained=ruby_gained if leveled_up else None,
+        new_ruby=new_ruby if leveled_up else None,
+    )
+
+
+@app.post("/api/route-task")
+async def route_task(
+    request: RouteTaskRequest,
+    db: Session = Depends(get_db),
+) -> RouteTaskResponse:
+    """
+    相棒（マネージャー）がタスクに最適なクルーを選定する
+    """
+    # 相棒を取得
+    partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+    if not partner:
+        raise HTTPException(status_code=400, detail="相棒が設定されていません")
+
+    # 全クルーを取得
+    crews = db.query(CrewModel).all()
+    crew_list = [{"id": c.id, "name": c.name, "role": c.role} for c in crews]
+
+    # 相棒にルーティングを依頼
+    personality = partner.personality or "真面目で丁寧な対応を心がける。"
+    result = await route_task_with_partner(
+        partner_name=partner.name,
+        partner_personality=personality,
+        crews=crew_list,
+        task=request.task,
+    )
+
+    return RouteTaskResponse(
+        success=result["success"],
+        selected_crew_id=result["selected_crew_id"],
+        selected_crew_name=result["selected_crew_name"],
+        partner_comment=result["partner_comment"],
+        partner_name=partner.name,
+        error=result.get("error"),
+    )
+
+
+def roll_rarity() -> int:
+    """
+    レアリティを抽選する
+
+    確率:
+    - ★1: 40%
+    - ★2: 30%
+    - ★3: 20%
+    - ★4: 8%
+    - ★5: 2%
+    """
+    import random
+    roll = random.random() * 100
+    if roll < 2:
+        return 5
+    elif roll < 10:
+        return 4
+    elif roll < 30:
+        return 3
+    elif roll < 60:
+        return 2
+    else:
+        return 1
+
+
+# 性格定義
+FREE_PERSONALITIES = {
+    "熱血": "熱血で情熱的。語尾に「〜だぜ！」を使う。",
+    "おだやか": "穏やかで優しい。丁寧な敬語を使う。",
+    "明るい": "明るくフレンドリー。「〜だよ！」「〜じゃん！」を使う。",
+    "クール": "クールで寡黙。「...」を多用する。",
+    "頭脳派": "真面目で責任感が強い。断定的な表現を使う。",
+}
+
+PREMIUM_PERSONALITIES = {
+    "ナルシスト": {"description": "自分大好きナルシスト。「〜な俺様」「美しい」を多用。", "cost": 50},
+    "王様": {"description": "王様気質で尊大。「〜であるぞ」「余は〜」を使う。", "cost": 50},
+    "ツンデレ": {"description": "ツンデレ口調。「べ、別に〜じゃないんだから！」を多用。", "cost": 50},
+    "お嬢様": {"description": "お嬢様言葉。「〜ですわ」「おほほ」を使う。", "cost": 50},
+    "科学者": {"description": "マッドサイエンティスト風。「〜なのだ！」「仮説では〜」を使う。", "cost": 50},
+    "忍者": {"description": "忍者口調。「〜でござる」「拙者は〜」を使う。", "cost": 50},
+}
+
+
+def calculate_base_stats(role: str, level: int = 1) -> dict:
+    """
+    役割とレベルに基づいてステータスを計算
+    """
+    base_value = 30 + level * 5  # 基本値
+
+    role_info = ROLES.get(role)
+    if not role_info:
+        # フォールバック: バランス型
+        return {"speed": base_value, "creativity": base_value, "mood": base_value}
+
+    weights = role_info["stats_weight"]
+    return {
+        "speed": int(base_value * weights["speed"]),
+        "creativity": int(base_value * weights["creativity"]),
+        "mood": int(base_value * weights["mood"]),
+    }
+
+
+def assign_skills_to_crew(db: Session, crew_id: int, role: str) -> list[SkillInfo]:
+    """
+    クルーにスキルを3つ付与する
+
+    1. 必須スキル: 役割に相応しいスキルから1つ
+    2. サブスキル: ランダムで1つ
+    3. ランダム: 完全ランダムで1つ（意外な組み合わせ用）
+    """
+    import random
+
+    # 全スキルを取得
+    all_skills = db.query(Skill).all()
+    if not all_skills:
+        return []
+
+    skill_by_name = {s.name: s for s in all_skills}
+    assigned_skill_ids: set[int] = set()
+    result: list[SkillInfo] = []
+
+    # 役割情報を取得
+    role_info = ROLES.get(role, ROLES["Engineer"])  # フォールバック: Engineer
+    primary_skill_names = role_info.get("primary_skills", [])
+
+    # 1. 必須スキル（役割に相応しいスキル）
+    available_primary = [skill_by_name[n] for n in primary_skill_names if n in skill_by_name]
+    if available_primary:
+        primary_skill = random.choice(available_primary)
+        assigned_skill_ids.add(primary_skill.id)
+        crew_skill = CrewSkill(
+            crew_id=crew_id,
+            skill_id=primary_skill.id,
+            level=1,
+            slot_type="primary",
+        )
+        db.add(crew_skill)
+        result.append(SkillInfo(
+            name=primary_skill.name,
+            level=1,
+            skill_type=primary_skill.skill_type,
+            description=primary_skill.description,
+            bonus_effect=primary_skill.bonus_effect,
+            slot_type="primary",
+        ))
+
+    # 2. サブスキル（ランダム、必須スキルと重複しない）
+    remaining_skills = [s for s in all_skills if s.id not in assigned_skill_ids]
+    if remaining_skills:
+        sub_skill = random.choice(remaining_skills)
+        assigned_skill_ids.add(sub_skill.id)
+        crew_skill = CrewSkill(
+            crew_id=crew_id,
+            skill_id=sub_skill.id,
+            level=1,
+            slot_type="sub",
+        )
+        db.add(crew_skill)
+        result.append(SkillInfo(
+            name=sub_skill.name,
+            level=1,
+            skill_type=sub_skill.skill_type,
+            description=sub_skill.description,
+            bonus_effect=sub_skill.bonus_effect,
+            slot_type="sub",
+        ))
+
+    # 3. ランダムスキル（完全ランダム、既に付与されたものと重複しない）
+    remaining_skills = [s for s in all_skills if s.id not in assigned_skill_ids]
+    if remaining_skills:
+        random_skill = random.choice(remaining_skills)
+        assigned_skill_ids.add(random_skill.id)
+        crew_skill = CrewSkill(
+            crew_id=crew_id,
+            skill_id=random_skill.id,
+            level=1,
+            slot_type="random",
+        )
+        db.add(crew_skill)
+        result.append(SkillInfo(
+            name=random_skill.name,
+            level=1,
+            skill_type=random_skill.skill_type,
+            description=random_skill.description,
+            bonus_effect=random_skill.bonus_effect,
+            slot_type="random",
+        ))
+
+    return result
+
+
+@app.post("/api/scout")
+async def scout_crew(
+    db: Session = Depends(get_db),
+) -> ScoutResponse:
+    """
+    コインを消費して新しいクルーをスカウト（ガチャ）
+
+    - 300コインを消費
+    - レアリティを抽選（★1〜★5）
+    - 役割・性格・スキルをランダム付与
+    - レアリティに応じた豪華キーワードで画像生成
+    - ★4以上で相棒が特別コメント
+    """
+    import random
+    SCOUT_COST = 300
+
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # コイン残高を確認
+    if user.coin < SCOUT_COST:
+        return ScoutResponse(
+            success=False,
+            error=f"コインが足りません（必要: {SCOUT_COST}、現在: {user.coin}）",
+            new_coin=user.coin,
+        )
+
+    # コインを消費
+    user.coin -= SCOUT_COST
+    new_coin = user.coin
+
+    # レアリティを抽選
+    rarity = roll_rarity()
+    logger.info(f"Rolled rarity: ★{rarity}")
+
+    # ランダムな名前を生成
+    first_names = ["ブレイズ", "ミスト", "サンダー", "フロスト", "ストーム", "シャイン", "ダーク", "ライト", "ゴールド", "シルバー"]
+    last_names = ["ィ", "ン", "ー", "ス", "ト", "ク", "ル", "ア", "オ", "エ"]
+
+    # レアリティが高いほど豪華な名前のプレフィックスを追加
+    rarity_prefixes = {
+        1: "",
+        2: "",
+        3: "★",
+        4: "【金】",
+        5: "【伝説】",
+    }
+
+    name = rarity_prefixes[rarity] + random.choice(first_names) + random.choice(last_names)
+
+    # 役割をランダム決定（新しいROLESから）
+    role = random.choice(list(ROLES.keys()))
+    role_label = ROLES[role]["label"]
+
+    # 性格をランダム決定（新しいPERSONALITIESから）
+    personality_key = random.choice(list(PERSONALITIES.keys()))
+    personality_info = PERSONALITIES[personality_key]
+    personality_label = personality_info["label"]
+    personality_tone = personality_info["tone"]
+
+    # AI画像生成（レアリティを渡す）
+    logger.info(f"Scouting new crew: {name} (Role: {role}, Personality: {personality_key}, ★{rarity})")
+    image_url = await generate_crew_image_with_fallback(name, rarity)
+
+    # クルーをDBに保存
+    new_crew = CrewModel(
+        name=name,
+        role=role,
+        personality=personality_key,  # キーを保存
+        image_url=image_url,
+        level=1,
+        exp=0,
+        rarity=rarity,
+    )
+    db.add(new_crew)
+    db.commit()
+    db.refresh(new_crew)
+
+    # スキルを付与
+    assigned_skills = assign_skills_to_crew(db, new_crew.id, role)
+    db.commit()
+
+    logger.info(f"Scouted new crew: {new_crew.name} (ID: {new_crew.id}, Role: {role}, ★{rarity})")
+    logger.info(f"Assigned skills: {[s.name for s in assigned_skills]}")
+
+    # ステータスを計算
+    stats = calculate_base_stats(role, level=1)
+
+    # 入社挨拶を生成（性格のトーンを使用）
+    greeting = await generate_greeting(
+        crew_name=name,
+        crew_role=role_label,
+        personality=personality_tone,
+    )
+
+    # ★4以上の場合、相棒の反応を追加
+    partner_reaction = None
+    if rarity >= 4:
+        partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+        if partner:
+            if rarity == 5:
+                partner_reaction = f"{partner.name}「とんでもない逸材をスカウトしたぜ！これは伝説級だ！！」"
+            else:
+                partner_reaction = f"{partner.name}「おおっ！かなりの実力者をスカウトできたな！」"
+
+    return ScoutResponse(
+        success=True,
+        crew=ScoutedCrewResponse(
+            id=new_crew.id,
+            name=new_crew.name,
+            role=new_crew.role,
+            role_label=role_label,
+            level=new_crew.level,
+            exp=new_crew.exp,
+            image=new_crew.image_url,
+            personality=personality_key,
+            personality_label=personality_label,
+            rarity=new_crew.rarity,
+            stats=StatsInfo(**stats),
+            skills=assigned_skills,
+        ),
+        greeting=greeting,
+        new_coin=new_coin,
+        rarity=rarity,
+        partner_reaction=partner_reaction,
+    )
+
+
+@app.get("/api/personalities")
+async def get_personalities(db: Session = Depends(get_db)) -> PersonalitiesResponse:
+    """
+    利用可能な性格一覧を取得
+    無料性格とプレミアム性格（アンロック状態を含む）
+    """
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # アンロック済み性格を取得
+    unlocked_keys = set()
+    unlocked = db.query(UnlockedPersonality).filter(
+        UnlockedPersonality.user_id == user.id
+    ).all()
+    for u in unlocked:
+        unlocked_keys.add(u.personality_key)
+
+    # 無料性格リスト
+    free_list = [
+        PersonalityInfo(
+            key=key,
+            name=key,
+            description=desc,
+            cost=0,
+            is_unlocked=True,
+        )
+        for key, desc in FREE_PERSONALITIES.items()
+    ]
+
+    # プレミアム性格リスト
+    premium_list = [
+        PersonalityInfo(
+            key=key,
+            name=key,
+            description=info["description"],
+            cost=info["cost"],
+            is_unlocked=(key in unlocked_keys),
+        )
+        for key, info in PREMIUM_PERSONALITIES.items()
+    ]
+
+    return PersonalitiesResponse(
+        free_personalities=free_list,
+        premium_personalities=premium_list,
+    )
+
+
+@app.post("/api/personalities/unlock")
+async def unlock_personality(
+    request: UnlockPersonalityRequest,
+    db: Session = Depends(get_db),
+) -> UnlockPersonalityResponse:
+    """
+    プレミアム性格をアンロックする（ルビー消費）
+    """
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 性格が存在するか確認
+    if request.personality_key not in PREMIUM_PERSONALITIES:
+        return UnlockPersonalityResponse(
+            success=False,
+            error=f"不明な性格: {request.personality_key}",
+        )
+
+    # すでにアンロック済みかチェック
+    existing = db.query(UnlockedPersonality).filter(
+        UnlockedPersonality.user_id == user.id,
+        UnlockedPersonality.personality_key == request.personality_key
+    ).first()
+    if existing:
+        return UnlockPersonalityResponse(
+            success=False,
+            error=f"性格「{request.personality_key}」はすでにアンロック済みです",
+            new_ruby=user.ruby,
+        )
+
+    # コストを取得
+    cost = PREMIUM_PERSONALITIES[request.personality_key]["cost"]
+
+    # ルビー残高を確認
+    if user.ruby < cost:
+        return UnlockPersonalityResponse(
+            success=False,
+            error=f"ルビーが足りません（必要: {cost}、現在: {user.ruby}）",
+            new_ruby=user.ruby,
+        )
+
+    # ルビーを消費
+    user.ruby -= cost
+
+    # アンロック記録を保存
+    unlock = UnlockedPersonality(
+        user_id=user.id,
+        personality_key=request.personality_key,
+    )
+    db.add(unlock)
+    db.commit()
+
+    logger.info(f"Unlocked personality: {request.personality_key} for user {user.id}")
+
+    return UnlockPersonalityResponse(
+        success=True,
+        new_ruby=user.ruby,
+    )
+
+
+@app.post("/api/partner/greeting")
+async def get_partner_whimsical_talk(
+    request: WhimsicalTalkRequest,
+    db: Session = Depends(get_db),
+) -> WhimsicalTalkResponse:
+    """
+    相棒の「気まぐれトーク」を取得
+
+    時間帯・資産状況・性格を考慮してセリフを生成
+    """
+    # 相棒を取得
+    partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+    if not partner:
+        return WhimsicalTalkResponse(
+            success=False,
+            error="相棒が設定されていません",
+        )
+
+    # ユーザー情報を取得
+    user = db.query(UserModel).first()
+    if not user:
+        return WhimsicalTalkResponse(
+            success=False,
+            error="ユーザーが見つかりません",
+        )
+
+    # 時間帯の検証
+    valid_times = ["morning", "afternoon", "evening", "night"]
+    time_of_day = request.time_of_day if request.time_of_day in valid_times else "afternoon"
+
+    # 気まぐれトークを生成
+    personality = partner.personality or "フレンドリーで明るい"
+    talk = await generate_whimsical_talk(
+        crew_name=partner.name,
+        crew_role=partner.role,
+        personality=personality,
+        time_of_day=time_of_day,
+        coin=user.coin,
+        ruby=user.ruby,
+    )
+
+    return WhimsicalTalkResponse(
+        success=True,
+        talk=talk,
+        partner_name=partner.name,
+        partner_image=partner.image_url,
+    )
+
+
+@app.get("/api/daily-report")
+async def get_daily_report(
+    db: Session = Depends(get_db),
+) -> DailyReportResponse:
+    """
+    日報（デイリーレポート）を取得
+
+    - 本日のタスク数・獲得コインを集計
+    - 過去7日分のスタンプ情報を返す
+    - 初回アクセス時はログインボーナス（100コイン）を付与
+    - 相棒の労いの言葉を生成
+    """
+    LOGIN_BONUS = 100
+
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 相棒を取得
+    partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+
+    # 今日の日付
+    today = date.today()
+    today_str = today.isoformat()
+
+    # 今日のDailyLogを取得（なければ作成）
+    daily_log = db.query(DailyLog).filter(
+        DailyLog.user_id == user.id,
+        DailyLog.date == today,
+    ).first()
+
+    # 今日のタスク数を集計（TaskLogから）
+    today_start = datetime.combine(today, datetime.min.time())
+    today_end = datetime.combine(today, datetime.max.time())
+    task_count = db.query(TaskLog).filter(
+        TaskLog.created_at >= today_start,
+        TaskLog.created_at <= today_end,
+    ).count()
+
+    # 今日の獲得コイン（タスク1件につき50コイン）
+    earned_coins = task_count * 50
+
+    # ログインボーナスの処理
+    login_bonus_given = False
+    if daily_log is None:
+        # 新規作成（初回アクセス）
+        daily_log = DailyLog(
+            user_id=user.id,
+            date=today,
+            task_count=task_count,
+            earned_coins=earned_coins,
+            login_stamp=True,
+        )
+        db.add(daily_log)
+
+        # ログインボーナスを付与
+        user.coin += LOGIN_BONUS
+        login_bonus_given = True
+        logger.info(f"Login bonus given: +{LOGIN_BONUS} coins")
+    else:
+        # 既存レコードを更新
+        daily_log.task_count = task_count
+        daily_log.earned_coins = earned_coins
+
+    db.commit()
+    db.refresh(daily_log)
+
+    # 過去7日分のスタンプ情報を取得
+    stamps: list[StampInfo] = []
+    for i in range(6, -1, -1):  # 7日前から今日まで
+        target_date = today - timedelta(days=i)
+        log = db.query(DailyLog).filter(
+            DailyLog.user_id == user.id,
+            DailyLog.date == target_date,
+        ).first()
+        stamps.append(StampInfo(
+            date=target_date.isoformat(),
+            has_stamp=log is not None and log.login_stamp,
+        ))
+
+    # 連続ログイン日数を計算
+    consecutive_days = 0
+    for i in range(7):  # 最大7日まで
+        target_date = today - timedelta(days=i)
+        log = db.query(DailyLog).filter(
+            DailyLog.user_id == user.id,
+            DailyLog.date == target_date,
+            DailyLog.login_stamp == True,
+        ).first()
+        if log:
+            consecutive_days += 1
+        else:
+            break
+
+    # 相棒の労いの言葉を生成
+    labor_words = "お疲れ様でした！"
+    partner_name = None
+    partner_image = None
+
+    if partner:
+        partner_name = partner.name
+        partner_image = partner.image_url
+        personality = partner.personality or "フレンドリーで明るい"
+        labor_words = await generate_labor_words(
+            crew_name=partner.name,
+            personality=personality,
+            task_count=task_count,
+            earned_coins=earned_coins,
+            consecutive_days=consecutive_days,
+        )
+
+    # 労いの言葉をDailyLogに保存
+    daily_log.partner_comment = labor_words
+    db.commit()
+
+    return DailyReportResponse(
+        success=True,
+        date=today_str,
+        task_count=task_count,
+        earned_coins=earned_coins,
+        login_bonus_given=login_bonus_given,
+        login_bonus_amount=LOGIN_BONUS if login_bonus_given else 0,
+        stamps=stamps,
+        consecutive_days=consecutive_days,
+        labor_words=labor_words,
+        partner_name=partner_name,
+        partner_image=partner_image,
+        new_coin=user.coin,
+    )
+
+
+@app.post("/api/crews/{crew_id}/evolve")
+async def evolve_crew(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> EvolveCrewResponse:
+    """
+    クルーを昇進（進化）させる
+
+    条件:
+    - クルーのレベルが10以上
+    - ユーザーが10ルビー以上所持（消費する）
+
+    処理:
+    - 現在の画像をベースにNova CanvasのImage-to-Imageで進化後の画像を生成
+    - 役職に "Senior " プレフィックスを追加
+    - 進化フラグをセット（レアリティを1上げる）
+    """
+    EVOLVE_COST = 10  # 必要ルビー
+    REQUIRED_LEVEL = 10  # 必要レベル
+
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # クルーを取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # レベル条件をチェック
+    if crew.level < REQUIRED_LEVEL:
+        return EvolveCrewResponse(
+            success=False,
+            error=f"レベルが足りません（必要: Lv.{REQUIRED_LEVEL}、現在: Lv.{crew.level}）",
+            new_ruby=user.ruby,
+        )
+
+    # ルビー残高をチェック
+    if user.ruby < EVOLVE_COST:
+        return EvolveCrewResponse(
+            success=False,
+            error=f"ルビーが足りません（必要: {EVOLVE_COST}💎、現在: {user.ruby}💎）",
+            new_ruby=user.ruby,
+        )
+
+    # 既に進化済み（役職が "Senior " で始まる）かチェック
+    if crew.role.startswith("Senior "):
+        return EvolveCrewResponse(
+            success=False,
+            error=f"{crew.name}は既に昇進済みです",
+            new_ruby=user.ruby,
+        )
+
+    # ルビーを消費
+    user.ruby -= EVOLVE_COST
+    logger.info(f"Evolving crew: {crew.name} (ID: {crew.id}), consuming {EVOLVE_COST} rubies")
+
+    # 進化前の状態を保存
+    old_image = crew.image_url
+    old_role = crew.role
+
+    try:
+        # 進化画像を生成
+        new_image = await evolve_crew_image(crew.image_url, crew.name)
+        logger.info(f"Generated evolved image: {new_image}")
+
+        # 役職をランクアップ
+        new_role = f"Senior {crew.role}"
+
+        # レアリティを1上げる（最大5）
+        new_rarity = min(crew.rarity + 1, 5)
+
+        # DBを更新
+        crew.image_url = new_image
+        crew.role = new_role
+        crew.rarity = new_rarity
+
+        db.commit()
+        db.refresh(crew)
+
+        logger.info(f"Crew evolved: {crew.name} -> {new_role} (rarity: {new_rarity})")
+
+        return EvolveCrewResponse(
+            success=True,
+            crew=CrewResponse(
+                id=crew.id,
+                name=crew.name,
+                role=crew.role,
+                level=crew.level,
+                exp=crew.exp,
+                image=crew.image_url,
+                personality=crew.personality,
+                is_partner=crew.is_partner,
+                rarity=crew.rarity,
+            ),
+            old_image=old_image,
+            new_image=new_image,
+            old_role=old_role,
+            new_role=new_role,
+            new_ruby=user.ruby,
+        )
+
+    except Exception as e:
+        # 画像生成に失敗した場合はロールバック
+        db.rollback()
+        user.ruby += EVOLVE_COST  # ルビーを返却
+        db.commit()
+
+        logger.error(f"Evolution failed: {e}")
+        return EvolveCrewResponse(
+            success=False,
+            error=f"昇進に失敗しました: {str(e)}",
+            new_ruby=user.ruby,
+        )
+
+
+# ==============================
+# 連携デモ（CrewAI風）API
+# ==============================
+
+class CollaborationRequest(BaseModel):
+    youtube_url: str
+
+
+class CollaborationStep(BaseModel):
+    agent_id: int
+    agent_name: str
+    agent_image: str
+    role: str  # "analyst" or "writer"
+    status: str  # "thinking", "done", "writing"
+    output: str | None = None
+
+
+class CollaborationResponse(BaseModel):
+    success: bool
+    steps: list[CollaborationStep]
+    final_article: str | None = None
+    error: str | None = None
+
+
+@app.post("/api/demo/collaboration")
+async def demo_collaboration(
+    request: CollaborationRequest,
+    db: Session = Depends(get_db),
+) -> CollaborationResponse:
+    """
+    複数クルーが連携してYouTube動画をブログ記事にするデモ
+
+    Agent A (Analyst): 動画の内容を要約
+    Agent B (Writer): 要約をブログ記事に変換
+
+    字幕取得に成功した場合は実際の内容を使用、
+    失敗した場合はダミーのAIトピックで生成を続行
+    """
+    from services.bedrock_service import get_bedrock_client, MODEL_ID
+    import json
+
+    logger.info(f"Collaboration demo started with URL: {request.youtube_url}")
+
+    # ========== Step 0: YouTube字幕を取得 ==========
+    transcript, status_message = get_transcript_from_url(request.youtube_url)
+
+    if transcript:
+        print(f"[Collaboration] ✅ 字幕取得成功: {len(transcript)} chars")
+        logger.info(f"Transcript fetched successfully: {len(transcript)} chars")
+        use_real_transcript = True
+    else:
+        print(f"[Collaboration] ⚠️ 字幕取得失敗: {status_message} - ダミーモードで続行")
+        logger.warning(f"Transcript fetch failed: {status_message} - using dummy mode")
+        use_real_transcript = False
+
+    # 担当クルーを取得（ロッキー=分析担当、アクアン=ライター担当）
+    analyst = db.query(CrewModel).filter(CrewModel.name == "ロッキー").first()
+    writer = db.query(CrewModel).filter(CrewModel.name == "アクアン").first()
+
+    if not analyst or not writer:
+        # フォールバック: 最初の2人を使用
+        all_crews = db.query(CrewModel).limit(2).all()
+        if len(all_crews) < 2:
+            return CollaborationResponse(
+                success=False,
+                steps=[],
+                error="クルーが不足しています",
+            )
+        analyst, writer = all_crews[0], all_crews[1]
+
+    steps: list[CollaborationStep] = []
+
+    try:
+        client = get_bedrock_client()
+
+        # ========== 1回のAPI呼び出しで両方の処理を実行 ==========
+        logger.info(f"Running collaboration demo: {analyst.name} -> {writer.name}")
+
+        # 字幕取得成功時と失敗時でプロンプトを分岐
+        if use_real_transcript:
+            # 実際の字幕を使用
+            combined_prompt = f"""あなたは2人のエキスパートになりきって、順番にタスクを実行してください。
+
+【タスク概要】
+以下のYouTube動画の字幕テキストを元に、ブログ記事を作成します。
+
+【動画URL】
+{request.youtube_url}
+
+【字幕テキスト】
+{transcript}
+
+=== Step 1: 分析担当（{analyst.name}）===
+上記の字幕テキストを読み、動画の重要なポイントを3-5つの箇条書きで要約してください。
+
+=== Step 2: ライター担当（{writer.name}）===
+Step 1の要約を元に、400-600字程度の魅力的なブログ記事を書いてください。
+- キャッチーなタイトル
+- 読者を引きつける導入
+- 各ポイントの展開
+- 行動を促す締め
+
+【出力フォーマット】
+## 分析結果（{analyst.name}）
+- ポイント1: ...
+- ポイント2: ...
+（以下省略）
+
+## ブログ記事（{writer.name}）
+# タイトル
+
+（本文）
+"""
+        else:
+            # ダミーモード（字幕取得失敗時）
+            combined_prompt = f"""あなたは2人のエキスパートになりきって、順番にタスクを実行してください。
+
+【タスク概要】
+YouTube動画URL「{request.youtube_url}」の内容をブログ記事にします。
+
+※注意: 動画の字幕を取得できませんでしたが、デモを継続します。
+「AIと仕事の未来」についての動画だと仮定して、一般的な内容で記事を作成してください。
+
+=== Step 1: 分析担当（{analyst.name}）===
+「AIと仕事の未来」というテーマで、動画に含まれていそうな重要なポイントを3-5つの箇条書きで要約してください。
+
+=== Step 2: ライター担当（{writer.name}）===
+Step 1の要約を元に、400-600字程度の魅力的なブログ記事を書いてください。
+- キャッチーなタイトル
+- 読者を引きつける導入
+- 各ポイントの展開
+- 行動を促す締め
+
+【出力フォーマット】
+## 分析結果（{analyst.name}）
+- ポイント1: ...
+- ポイント2: ...
+（以下省略）
+
+## ブログ記事（{writer.name}）
+# タイトル
+
+（本文）
+"""
+
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2000,
+            "temperature": 0.7,
+            "messages": [{"role": "user", "content": combined_prompt}],
+        }
+
+        response = client.invoke_model(
+            modelId=MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(request_body),
+        )
+
+        result = json.loads(response["body"].read())
+        full_output = result.get("content", [{}])[0].get("text", "").strip()
+
+        logger.info(f"Combined output length: {len(full_output)}")
+
+        # 出力を分割
+        analyst_output = ""
+        final_article = ""
+
+        if f"## 分析結果（{analyst.name}）" in full_output and f"## ブログ記事（{writer.name}）" in full_output:
+            parts = full_output.split(f"## ブログ記事（{writer.name}）")
+            analyst_output = parts[0].replace(f"## 分析結果（{analyst.name}）", "").strip()
+            final_article = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            # フォールバック: 全体を記事として扱う
+            analyst_output = "動画の分析が完了しました。"
+            final_article = full_output
+
+        # Step情報を構築
+        steps.append(CollaborationStep(
+            agent_id=analyst.id,
+            agent_name=analyst.name,
+            agent_image=analyst.image_url,
+            role="analyst",
+            status="done",
+            output=analyst_output,
+        ))
+
+        steps.append(CollaborationStep(
+            agent_id=writer.id,
+            agent_name=writer.name,
+            agent_image=writer.image_url,
+            role="writer",
+            status="done",
+            output=final_article,
+        ))
+
+        print(f"[Collaboration] ✅ デモ完了 (字幕モード: {'リアル' if use_real_transcript else 'ダミー'})")
+        logger.info(f"Collaboration demo completed successfully! (transcript mode: {'real' if use_real_transcript else 'dummy'})")
+
+        return CollaborationResponse(
+            success=True,
+            steps=steps,
+            final_article=final_article,
+        )
+
+    except Exception as e:
+        print(f"[Collaboration] ❌ エラー発生: {e}")
+        logger.error(f"Collaboration demo failed: {e}")
+        return CollaborationResponse(
+            success=False,
+            steps=steps,
+            error=str(e),
+        )
+
+
+# ==============================
+# ガジェットシステム API
+# ==============================
+
+class GadgetResponse(BaseModel):
+    id: int
+    name: str
+    description: str
+    icon: str
+    effect_type: str
+    base_effect_value: int
+    base_cost: int
+
+    model_config = {"from_attributes": True}
+
+
+class CrewGadgetResponse(BaseModel):
+    id: int
+    gadget_id: int
+    gadget_name: str
+    gadget_icon: str
+    gadget_description: str
+    effect_type: str
+    level: int
+    slot_index: int
+    current_effect: int  # 現在の効果値（レベル補正後）
+
+    model_config = {"from_attributes": True}
+
+
+class EquipGadgetRequest(BaseModel):
+    gadget_id: int
+    slot_index: int  # 0, 1, 2
+
+
+class EquipGadgetResponse(BaseModel):
+    success: bool
+    error: str | None = None
+    equipped_gadget: CrewGadgetResponse | None = None
+    new_coin: int | None = None
+
+
+class UpgradeGadgetResponse(BaseModel):
+    success: bool
+    error: str | None = None
+    upgraded_gadget: CrewGadgetResponse | None = None
+    new_coin: int | None = None
+    old_level: int | None = None
+    new_level: int | None = None
+    old_effect: int | None = None
+    new_effect: int | None = None
+
+
+def calculate_gadget_effect(base_value: int, level: int) -> int:
+    """ガジェットの効果値を計算（レベル補正）"""
+    # 効果 = base_effect_value * (1 + 0.2 * (level - 1))
+    return int(base_value * (1 + 0.2 * (level - 1)))
+
+
+def calculate_upgrade_cost(base_cost: int, current_level: int) -> int:
+    """ガジェットの強化コストを計算"""
+    # コスト = base_cost * 0.5 * current_level
+    return int(base_cost * 0.5 * current_level)
+
+
+@app.get("/api/gadgets")
+async def get_gadgets(db: Session = Depends(get_db)) -> list[GadgetResponse]:
+    """
+    購入可能なガジェット一覧を取得
+    """
+    gadgets = db.query(Gadget).all()
+    return [
+        GadgetResponse(
+            id=g.id,
+            name=g.name,
+            description=g.description,
+            icon=g.icon,
+            effect_type=g.effect_type,
+            base_effect_value=g.base_effect_value,
+            base_cost=g.base_cost,
+        )
+        for g in gadgets
+    ]
+
+
+@app.get("/api/crews/{crew_id}/gadgets")
+async def get_crew_gadgets(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> list[CrewGadgetResponse]:
+    """
+    指定したクルーの装備中ガジェット一覧を取得
+    """
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    crew_gadgets = db.query(CrewGadget).filter(CrewGadget.crew_id == crew_id).all()
+
+    return [
+        CrewGadgetResponse(
+            id=cg.id,
+            gadget_id=cg.gadget.id,
+            gadget_name=cg.gadget.name,
+            gadget_icon=cg.gadget.icon,
+            gadget_description=cg.gadget.description,
+            effect_type=cg.gadget.effect_type,
+            level=cg.level,
+            slot_index=cg.slot_index,
+            current_effect=calculate_gadget_effect(cg.gadget.base_effect_value, cg.level),
+        )
+        for cg in crew_gadgets
+    ]
+
+
+@app.post("/api/crews/{crew_id}/gadgets/equip")
+async def equip_gadget(
+    crew_id: int,
+    request: EquipGadgetRequest,
+    db: Session = Depends(get_db),
+) -> EquipGadgetResponse:
+    """
+    ガジェットを購入して装備する
+
+    - gadget_id: 装備するガジェットのID
+    - slot_index: 装備するスロット（0, 1, 2）
+    - コインを消費する
+    """
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # クルーを取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # ガジェットを取得
+    gadget = db.query(Gadget).filter(Gadget.id == request.gadget_id).first()
+    if not gadget:
+        raise HTTPException(status_code=404, detail="Gadget not found")
+
+    # スロット番号の検証
+    if request.slot_index not in [0, 1, 2]:
+        return EquipGadgetResponse(
+            success=False,
+            error="無効なスロット番号です（0, 1, 2のいずれか）",
+        )
+
+    # スロット解放条件のチェック
+    slot_unlock_levels = {0: 1, 1: 10, 2: 20}
+    required_level = slot_unlock_levels[request.slot_index]
+    if crew.level < required_level:
+        return EquipGadgetResponse(
+            success=False,
+            error=f"スロット{request.slot_index + 1}はLv.{required_level}で解放されます（現在: Lv.{crew.level}）",
+        )
+
+    # コイン残高をチェック
+    if user.coin < gadget.base_cost:
+        return EquipGadgetResponse(
+            success=False,
+            error=f"コインが足りません（必要: {gadget.base_cost}、現在: {user.coin}）",
+            new_coin=user.coin,
+        )
+
+    # 既存の装備を確認（同じスロットに装備がある場合は上書き）
+    existing = db.query(CrewGadget).filter(
+        CrewGadget.crew_id == crew_id,
+        CrewGadget.slot_index == request.slot_index,
+    ).first()
+
+    if existing:
+        # 既存装備を削除
+        db.delete(existing)
+
+    # コインを消費
+    user.coin -= gadget.base_cost
+
+    # 新しい装備を作成
+    new_crew_gadget = CrewGadget(
+        crew_id=crew_id,
+        gadget_id=gadget.id,
+        level=1,
+        slot_index=request.slot_index,
+    )
+    db.add(new_crew_gadget)
+    db.commit()
+    db.refresh(new_crew_gadget)
+
+    logger.info(f"Equipped gadget: {gadget.name} to {crew.name} slot {request.slot_index}")
+
+    return EquipGadgetResponse(
+        success=True,
+        equipped_gadget=CrewGadgetResponse(
+            id=new_crew_gadget.id,
+            gadget_id=gadget.id,
+            gadget_name=gadget.name,
+            gadget_icon=gadget.icon,
+            gadget_description=gadget.description,
+            effect_type=gadget.effect_type,
+            level=new_crew_gadget.level,
+            slot_index=new_crew_gadget.slot_index,
+            current_effect=calculate_gadget_effect(gadget.base_effect_value, new_crew_gadget.level),
+        ),
+        new_coin=user.coin,
+    )
+
+
+@app.post("/api/crews/{crew_id}/gadgets/{gadget_id}/upgrade")
+async def upgrade_gadget(
+    crew_id: int,
+    gadget_id: int,
+    db: Session = Depends(get_db),
+) -> UpgradeGadgetResponse:
+    """
+    装備中のガジェットをレベルアップする
+
+    - コストはレベルに応じて上昇
+    - 効果は base_effect_value * (1 + 0.2 * (level - 1))
+    """
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # クルーを取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # 装備中のガジェットを取得
+    crew_gadget = db.query(CrewGadget).filter(
+        CrewGadget.crew_id == crew_id,
+        CrewGadget.gadget_id == gadget_id,
+    ).first()
+
+    if not crew_gadget:
+        return UpgradeGadgetResponse(
+            success=False,
+            error="このガジェットは装備されていません",
+        )
+
+    gadget = crew_gadget.gadget
+    current_level = crew_gadget.level
+    old_effect = calculate_gadget_effect(gadget.base_effect_value, current_level)
+
+    # 最大レベルチェック（最大10）
+    if current_level >= 10:
+        return UpgradeGadgetResponse(
+            success=False,
+            error="ガジェットは最大レベルに達しています",
+        )
+
+    # 強化コストを計算
+    upgrade_cost = calculate_upgrade_cost(gadget.base_cost, current_level)
+
+    # コイン残高をチェック
+    if user.coin < upgrade_cost:
+        return UpgradeGadgetResponse(
+            success=False,
+            error=f"コインが足りません（必要: {upgrade_cost}、現在: {user.coin}）",
+            new_coin=user.coin,
+        )
+
+    # コインを消費
+    user.coin -= upgrade_cost
+
+    # レベルアップ
+    crew_gadget.level += 1
+    new_level = crew_gadget.level
+    new_effect = calculate_gadget_effect(gadget.base_effect_value, new_level)
+
+    db.commit()
+    db.refresh(crew_gadget)
+
+    logger.info(f"Upgraded gadget: {gadget.name} Lv.{current_level} -> Lv.{new_level}")
+
+    return UpgradeGadgetResponse(
+        success=True,
+        upgraded_gadget=CrewGadgetResponse(
+            id=crew_gadget.id,
+            gadget_id=gadget.id,
+            gadget_name=gadget.name,
+            gadget_icon=gadget.icon,
+            gadget_description=gadget.description,
+            effect_type=gadget.effect_type,
+            level=new_level,
+            slot_index=crew_gadget.slot_index,
+            current_effect=new_effect,
+        ),
+        new_coin=user.coin,
+        old_level=current_level,
+        new_level=new_level,
+        old_effect=old_effect,
+        new_effect=new_effect,
+    )
+
+
+# ============================================================
+# スキル強化API
+# ============================================================
+
+class SkillUpgradeResult(BaseModel):
+    skill_name: str
+    old_level: int
+    new_level: int
+    increase: int
+
+
+class UpgradeSkillsResponse(BaseModel):
+    success: bool
+    error: str | None = None
+    new_coin: int | None = None
+    cost: int | None = None
+    upgraded_skills: list[SkillUpgradeResult] = []
+
+
+@app.post("/api/crews/{crew_id}/upgrade-skills")
+async def upgrade_crew_skills(
+    crew_id: int,
+    db: Session = Depends(get_db),
+) -> UpgradeSkillsResponse:
+    """
+    クルーのスキルをランダムに強化する（100コイン消費）
+
+    - 各スキルが1〜5ランダムに上昇
+    - 最大レベル10を超えない
+    """
+    import random
+
+    UPGRADE_COST = 100
+
+    # ユーザーを取得
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # クルーを取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # コイン残高をチェック
+    if user.coin < UPGRADE_COST:
+        return UpgradeSkillsResponse(
+            success=False,
+            error=f"コインが足りません（必要: {UPGRADE_COST}、現在: {user.coin}）",
+            new_coin=user.coin,
+        )
+
+    # クルーのスキルを取得
+    crew_skills = db.query(CrewSkill).filter(CrewSkill.crew_id == crew_id).all()
+
+    if not crew_skills:
+        return UpgradeSkillsResponse(
+            success=False,
+            error="スキルがありません",
+            new_coin=user.coin,
+        )
+
+    # コインを消費
+    user.coin -= UPGRADE_COST
+
+    # 各スキルをランダムに1〜5上昇
+    upgraded_skills = []
+    for crew_skill in crew_skills:
+        old_level = crew_skill.level
+        increase = random.randint(1, 5)
+        new_level = min(old_level + increase, 10)  # 最大10
+        actual_increase = new_level - old_level
+
+        if actual_increase > 0:
+            crew_skill.level = new_level
+            upgraded_skills.append(SkillUpgradeResult(
+                skill_name=crew_skill.skill.name,
+                old_level=old_level,
+                new_level=new_level,
+                increase=actual_increase,
+            ))
+
+    db.commit()
+
+    logger.info(f"Upgraded skills for crew {crew.name}: {[s.skill_name for s in upgraded_skills]}")
+
+    return UpgradeSkillsResponse(
+        success=True,
+        new_coin=user.coin,
+        cost=UPGRADE_COST,
+        upgraded_skills=upgraded_skills,
+    )
+
+
+# ============================================================
+# Web記事要約API
+# ============================================================
+
+class WebSummaryRequest(BaseModel):
+    url: str
+
+
+class WebSummaryResponse(BaseModel):
+    success: bool
+    summary: str | None = None
+    page_title: str | None = None
+    crew_id: int | None = None
+    crew_name: str | None = None
+    crew_image: str | None = None
+    error: str | None = None
+
+
+@app.post("/api/tools/web-summary")
+async def summarize_web_article(
+    request: WebSummaryRequest,
+    db: Session = Depends(get_db),
+) -> WebSummaryResponse:
+    """
+    URLからWebページの内容を取得し、AIが要約する
+
+    - 「情報収集」スキルを持つクルー、またはランダムなクルーを担当に選出
+    - ビジネスパーソン向けに重要ポイント3点で要約
+    """
+    import random
+    import boto3
+    import json
+
+    try:
+        # 1. Webページからテキストを抽出
+        logger.info(f"Fetching web content from: {request.url}")
+        try:
+            content = fetch_web_content(request.url)
+        except ValueError as e:
+            return WebSummaryResponse(
+                success=False,
+                error=str(e),
+            )
+
+        # 2. 担当クルーを選定（「情報収集」スキル持ちを優先）
+        # 「情報収集」スキルを持つクルーを探す
+        research_skill = db.query(Skill).filter(Skill.name == "情報収集").first()
+        assigned_crew = None
+
+        if research_skill:
+            # このスキルを持つクルーを取得
+            crew_with_skill = (
+                db.query(CrewModel)
+                .join(CrewSkill)
+                .filter(CrewSkill.skill_id == research_skill.id)
+                .first()
+            )
+            if crew_with_skill:
+                assigned_crew = crew_with_skill
+
+        # スキル持ちがいなければランダム選択
+        if not assigned_crew:
+            all_crews = db.query(CrewModel).all()
+            if all_crews:
+                assigned_crew = random.choice(all_crews)
+
+        if not assigned_crew:
+            return WebSummaryResponse(
+                success=False,
+                error="担当できるクルーがいません。先にクルーを作成してください。",
+            )
+
+        # 3. Bedrockで要約を生成
+        prompt = f"""以下のWeb記事の内容を読み、ビジネスパーソン向けに重要なポイントを3点の箇条書きで要約してください。
+出力は日本語で行ってください。各ポイントは具体的かつ簡潔に記述してください。
+
+【記事本文】
+{content}
+
+【出力形式】
+• ポイント1: ...
+• ポイント2: ...
+• ポイント3: ..."""
+
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.5,
+        })
+
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            body=body
+        )
+
+        response_body = json.loads(response["body"].read())
+        summary = response_body["content"][0]["text"]
+
+        # ページタイトルを抽出（コンテンツの最初の行から）
+        page_title = None
+        if content.startswith("【タイトル】"):
+            first_line = content.split("\n")[0]
+            page_title = first_line.replace("【タイトル】", "").strip()
+
+        logger.info(f"Web summary generated by {assigned_crew.name}")
+
+        return WebSummaryResponse(
+            success=True,
+            summary=summary,
+            page_title=page_title,
+            crew_id=assigned_crew.id,
+            crew_name=assigned_crew.name,
+            crew_image=assigned_crew.image_url,
+        )
+
+    except ClientError as e:
+        logger.error(f"Bedrock API error: {e}")
+        return WebSummaryResponse(
+            success=False,
+            error="AI要約の生成に失敗しました。しばらく待ってから再度お試しください。",
+        )
+    except Exception as e:
+        logger.error(f"Web summary error: {e}")
+        return WebSummaryResponse(
+            success=False,
+            error=f"要約処理中にエラーが発生しました: {str(e)}",
+        )
+
+
+# ============================================================
+# PDFファイル要約API
+# ============================================================
+
+class FileSummaryResponse(BaseModel):
+    success: bool
+    summary: str | None = None
+    filename: str | None = None
+    page_count: int | None = None
+    crew_id: int | None = None
+    crew_name: str | None = None
+    crew_image: str | None = None
+    error: str | None = None
+
+
+# 最大ファイルサイズ（10MB）
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+
+@app.post("/api/tools/file-summary")
+async def summarize_pdf_file(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> FileSummaryResponse:
+    """
+    PDFファイルからテキストを抽出し、AIが要約する
+
+    - 「データ分析」または「情報収集」スキルを持つクルー、またはランダムなクルーを担当に選出
+    - ビジネスパーソン向けに重要ポイントを箇条書きで要約
+    """
+    import random
+    import boto3
+    import json
+
+    try:
+        # 1. ファイル形式チェック
+        if not file.filename:
+            return FileSummaryResponse(
+                success=False,
+                error="ファイル名が取得できませんでした。",
+            )
+
+        if not file.filename.lower().endswith('.pdf'):
+            return FileSummaryResponse(
+                success=False,
+                error="PDFファイルのみ対応しています。",
+            )
+
+        # 2. ファイルサイズチェック
+        file_content = await file.read()
+        if len(file_content) > MAX_FILE_SIZE:
+            return FileSummaryResponse(
+                success=False,
+                error=f"ファイルサイズが大きすぎます（最大10MB）。現在のサイズ: {len(file_content) / (1024 * 1024):.1f}MB",
+            )
+
+        # 3. PDFからテキスト抽出
+        logger.info(f"Extracting text from PDF: {file.filename}")
+        from io import BytesIO
+        file_stream = BytesIO(file_content)
+
+        try:
+            content = extract_text_from_pdf(file_stream)
+        except ValueError as e:
+            return FileSummaryResponse(
+                success=False,
+                error=str(e),
+            )
+
+        if not content or not content.strip():
+            return FileSummaryResponse(
+                success=False,
+                error="PDFからテキストを抽出できませんでした。画像のみのPDFの可能性があります。",
+            )
+
+        # ページ数を取得
+        file_stream.seek(0)
+        from pypdf import PdfReader
+        try:
+            reader = PdfReader(file_stream)
+            page_count = len(reader.pages)
+        except Exception:
+            page_count = None
+
+        # 4. 担当クルーを選定（「データ分析」または「情報収集」スキル持ちを優先）
+        assigned_crew = None
+        for skill_name in ["データ分析", "情報収集"]:
+            skill = db.query(Skill).filter(Skill.name == skill_name).first()
+            if skill:
+                crew_with_skill = (
+                    db.query(CrewModel)
+                    .join(CrewSkill)
+                    .filter(CrewSkill.skill_id == skill.id)
+                    .first()
+                )
+                if crew_with_skill:
+                    assigned_crew = crew_with_skill
+                    break
+
+        # スキル持ちがいなければランダム選択
+        if not assigned_crew:
+            all_crews = db.query(CrewModel).all()
+            if all_crews:
+                assigned_crew = random.choice(all_crews)
+
+        if not assigned_crew:
+            return FileSummaryResponse(
+                success=False,
+                error="担当できるクルーがいません。先にクルーを作成してください。",
+            )
+
+        # 5. Bedrockで要約を生成
+        prompt = f"""以下の資料（PDF）の内容を読み、ビジネスパーソン向けに重要なポイントを箇条書きで分かりやすく要約してください。
+出力は日本語で行ってください。各ポイントは具体的かつ簡潔に記述してください。
+
+【資料テキスト】
+{content}
+
+【出力形式】
+• ポイント1: ...
+• ポイント2: ...
+• ポイント3: ...
+（必要に応じて追加）"""
+
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1500,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.5,
+        })
+
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            body=body
+        )
+
+        response_body = json.loads(response["body"].read())
+        summary = response_body["content"][0]["text"]
+
+        logger.info(f"PDF summary generated by {assigned_crew.name} ({file.filename})")
+
+        return FileSummaryResponse(
+            success=True,
+            summary=summary,
+            filename=file.filename,
+            page_count=page_count,
+            crew_id=assigned_crew.id,
+            crew_name=assigned_crew.name,
+            crew_image=assigned_crew.image_url,
+        )
+
+    except ClientError as e:
+        logger.error(f"Bedrock API error: {e}")
+        return FileSummaryResponse(
+            success=False,
+            error="AI要約の生成に失敗しました。しばらく待ってから再度お試しください。",
+        )
+    except Exception as e:
+        logger.error(f"PDF summary error: {e}")
+        return FileSummaryResponse(
+            success=False,
+            error=f"要約処理中にエラーが発生しました: {str(e)}",
+        )
+
+
+# ============================================================
+# Director Mode API（プロジェクト自動構築）
+# ============================================================
+
+class RequiredInputSchema(BaseModel):
+    key: str
+    label: str
+    type: str  # file/url/text
+
+
+class TaskSchema(BaseModel):
+    role: str
+    assigned_crew_id: int
+    assigned_crew_name: str
+    assigned_crew_image: str
+    instruction: str
+
+
+class DirectorPlanRequest(BaseModel):
+    user_goal: str
+
+
+class DirectorPlanResponse(BaseModel):
+    success: bool
+    project_title: str | None = None
+    description: str | None = None
+    required_inputs: list[RequiredInputSchema] = []
+    tasks: list[TaskSchema] = []
+    partner_name: str | None = None
+    partner_image: str | None = None
+    error: str | None = None
+
+
+@app.post("/api/director/plan")
+async def create_project_plan(
+    request: DirectorPlanRequest,
+    db: Session = Depends(get_db),
+) -> DirectorPlanResponse:
+    """
+    ユーザーのゴールからプロジェクト計画を自動生成する（Director Mode）
+
+    - 相棒がPMとして、最適なクルー編成とタスクリストを作成
+    - 必要な入力情報（ファイル/URL等）を特定
+    """
+    import boto3
+    import json
+    import re
+
+    try:
+        # 1. 相棒を取得
+        partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+        if not partner:
+            return DirectorPlanResponse(
+                success=False,
+                error="相棒が設定されていません。先に相棒を任命してください。",
+            )
+
+        # 2. 全クルーの情報を取得
+        all_crews = db.query(CrewModel).all()
+        if len(all_crews) < 2:
+            return DirectorPlanResponse(
+                success=False,
+                error="プロジェクトを実行するには2人以上のクルーが必要です。",
+            )
+
+        # クルー情報をリスト化
+        crew_info_list = []
+        for crew in all_crews:
+            skills = []
+            for crew_skill in crew.skills:
+                skills.append(f"{crew_skill.skill.name}(Lv.{crew_skill.level})")
+
+            crew_info_list.append({
+                "id": crew.id,
+                "name": crew.name,
+                "role": crew.role,
+                "personality": crew.personality,
+                "skills": skills,
+                "is_partner": crew.is_partner,
+            })
+
+        crew_info_json = json.dumps(crew_info_list, ensure_ascii=False, indent=2)
+
+        # 3. Bedrockでプロジェクト計画を生成
+        prompt = f"""あなたは優秀なプロジェクトマネージャーです。
+ユーザーの目標を達成するために、以下のクルー（社員）を最適に割り当てたタスクリストを作成してください。
+
+## ユーザーの目標
+{request.user_goal}
+
+## 利用可能なクルー
+{crew_info_json}
+
+## あなたのタスク
+1. ゴールを達成するための具体的な「タスクリスト」を作成してください（2〜5個程度）
+2. 各タスクに「最適なクルー」を割り当ててください（スキルや役割を考慮）
+3. 実行にあたってユーザーから受け取る必要がある「不足情報（Input Requirements）」を特定してください
+
+## 出力形式（必ずこのJSON形式で出力）
+```json
+{{
+  "project_title": "プロジェクト名（20文字以内）",
+  "description": "プロジェクトの簡潔な説明（50文字以内）",
+  "required_inputs": [
+    {{ "key": "input_key_1", "label": "ユーザーへの表示ラベル", "type": "file" }},
+    {{ "key": "input_key_2", "label": "ユーザーへの表示ラベル", "type": "url" }},
+    {{ "key": "input_key_3", "label": "ユーザーへの表示ラベル", "type": "text" }}
+  ],
+  "tasks": [
+    {{ "role": "担当役割", "assigned_crew_id": クルーID, "instruction": "{{input_key_1}}を使って〜してください" }},
+    {{ "role": "担当役割", "assigned_crew_id": クルーID, "instruction": "前のタスク結果を元に〜してください" }}
+  ]
+}}
+```
+
+## 注意事項
+- typeは "file"（ファイルアップロード）, "url"（URL入力）, "text"（テキスト入力）のいずれか
+- instructionには必要に応じて {{key}} でインプットを参照
+- タスクは実行順に並べる
+- 必ず有効なJSONのみを出力（説明文は不要）"""
+
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2000,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+        })
+
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+            body=body
+        )
+
+        response_body = json.loads(response["body"].read())
+        ai_response = response_body["content"][0]["text"]
+
+        # 4. JSONを抽出してパース
+        # ```json ... ``` で囲まれている場合は抽出
+        json_match = re.search(r'```json\s*(.*?)\s*```', ai_response, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            # JSON形式の部分を探す
+            json_match = re.search(r'\{[\s\S]*\}', ai_response)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                raise ValueError("AIからの応答にJSONが含まれていません")
+
+        plan_data = json.loads(json_str)
+
+        # 5. タスクにクルー情報を追加
+        tasks_with_crew = []
+        crew_map = {crew.id: crew for crew in all_crews}
+
+        for task in plan_data.get("tasks", []):
+            crew_id = task.get("assigned_crew_id")
+            if crew_id in crew_map:
+                crew = crew_map[crew_id]
+                tasks_with_crew.append(TaskSchema(
+                    role=task.get("role", ""),
+                    assigned_crew_id=crew_id,
+                    assigned_crew_name=crew.name,
+                    assigned_crew_image=crew.image_url,
+                    instruction=task.get("instruction", ""),
+                ))
+            else:
+                # 存在しないクルーIDの場合、ランダムに割り当て
+                fallback_crew = all_crews[0]
+                tasks_with_crew.append(TaskSchema(
+                    role=task.get("role", ""),
+                    assigned_crew_id=fallback_crew.id,
+                    assigned_crew_name=fallback_crew.name,
+                    assigned_crew_image=fallback_crew.image_url,
+                    instruction=task.get("instruction", ""),
+                ))
+
+        # 6. 必須入力をパース
+        required_inputs = []
+        for inp in plan_data.get("required_inputs", []):
+            required_inputs.append(RequiredInputSchema(
+                key=inp.get("key", ""),
+                label=inp.get("label", ""),
+                type=inp.get("type", "text"),
+            ))
+
+        logger.info(f"Director plan created: {plan_data.get('project_title')} with {len(tasks_with_crew)} tasks")
+
+        return DirectorPlanResponse(
+            success=True,
+            project_title=plan_data.get("project_title", "新規プロジェクト"),
+            description=plan_data.get("description", ""),
+            required_inputs=required_inputs,
+            tasks=tasks_with_crew,
+            partner_name=partner.name,
+            partner_image=partner.image_url,
+        )
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error in director plan: {e}")
+        return DirectorPlanResponse(
+            success=False,
+            error="プロジェクト計画の解析に失敗しました。もう一度お試しください。",
+        )
+    except ClientError as e:
+        logger.error(f"Bedrock API error in director plan: {e}")
+        return DirectorPlanResponse(
+            success=False,
+            error="AI処理に失敗しました。しばらく待ってから再度お試しください。",
+        )
+    except Exception as e:
+        logger.error(f"Director plan error: {e}")
+        return DirectorPlanResponse(
+            success=False,
+            error=f"プロジェクト計画の作成中にエラーが発生しました: {str(e)}",
+        )
+
+
+class StartProjectRequest(BaseModel):
+    project_title: str
+    description: str
+    user_goal: str
+    required_inputs: list[RequiredInputSchema]
+    tasks: list[TaskSchema]
+    input_values: dict[str, str]  # key: value のマップ
+
+
+class StartProjectResponse(BaseModel):
+    success: bool
+    project_id: int | None = None
+    error: str | None = None
+
+
+@app.post("/api/director/start")
+async def start_project(
+    request: StartProjectRequest,
+    db: Session = Depends(get_db),
+) -> StartProjectResponse:
+    """
+    プロジェクトを開始する（データベースに保存）
+    """
+    try:
+        # 1. プロジェクトを作成
+        project = Project(
+            title=request.project_title,
+            description=request.description,
+            user_goal=request.user_goal,
+            status="planning",
+        )
+        db.add(project)
+        db.flush()  # IDを取得するため
+
+        # 2. 入力データを保存
+        for inp in request.required_inputs:
+            value = request.input_values.get(inp.key)
+            project_input = ProjectInput(
+                project_id=project.id,
+                key=inp.key,
+                label=inp.label,
+                input_type=inp.type,
+                value=value if inp.type != "file" else None,
+                file_path=value if inp.type == "file" else None,
+            )
+            db.add(project_input)
+
+        # 3. タスクを保存
+        for order, task in enumerate(request.tasks):
+            project_task = ProjectTask(
+                project_id=project.id,
+                crew_id=task.assigned_crew_id,
+                role=task.role,
+                instruction=task.instruction,
+                order=order,
+                status="pending",
+            )
+            db.add(project_task)
+
+        db.commit()
+
+        logger.info(f"Project started: {project.title} (ID: {project.id})")
+
+        return StartProjectResponse(
+            success=True,
+            project_id=project.id,
+        )
+
+    except Exception as e:
+        logger.error(f"Start project error: {e}")
+        db.rollback()
+        return StartProjectResponse(
+            success=False,
+            error=f"プロジェクトの保存に失敗しました: {str(e)}",
+        )
+
+
+# ============================================================
+# Director Mode - プロジェクト実行API
+# ============================================================
+
+class ExecuteProjectTaskResult(BaseModel):
+    """タスク実行結果"""
+    task_index: int
+    role: str
+    crew_name: str
+    crew_image: str
+    instruction: str
+    result: str
+    status: str  # completed / error
+
+
+class ExecuteProjectResponse(BaseModel):
+    """プロジェクト実行レスポンス"""
+    success: bool
+    project_title: str | None = None
+    task_results: list[ExecuteProjectTaskResult] = []
+    error: str | None = None
+
+
+@app.post("/api/director/execute")
+async def execute_project(
+    project_title: str = Form(...),
+    description: str = Form(...),
+    user_goal: str = Form(...),
+    required_inputs_json: str = Form(...),
+    tasks_json: str = Form(...),
+    input_values_json: str = Form(...),
+    files: Optional[list[UploadFile]] = File(None),
+    db: Session = Depends(get_db),
+) -> ExecuteProjectResponse:
+    """
+    プロジェクトを実行する（タスクを順次処理）
+
+    - 入力データ（PDF/URL/テキスト）を処理してコンテキスト構築
+    - タスクを順番にBedrock AIで実行
+    - 前のタスクの結果を次のタスクに引き継ぎ
+    """
+    from services.pdf_reader import extract_text_from_pdf
+    from services.web_reader import fetch_web_content
+    import io
+
+    try:
+        # JSONをパース
+        required_inputs = json.loads(required_inputs_json)
+        tasks = json.loads(tasks_json)
+        input_values = json.loads(input_values_json)
+
+        # ファイルをキーでマッピング
+        file_map: dict[str, UploadFile] = {}
+        if files is None:
+            files = []
+        logger.info(f"Received {len(files)} files")
+        for f in files:
+            logger.info(f"File received: filename={f.filename}, content_type={f.content_type}")
+            # ファイル名からキーを取得（フロントエンドで key:::filename 形式で送信）
+            if f.filename and ":::" in f.filename:
+                key = f.filename.split(":::")[0]
+                file_map[key] = f
+                logger.info(f"Mapped file key: {key}")
+
+        logger.info(f"File map keys: {list(file_map.keys())}")
+
+        # 1. コンテキスト構築（入力データのテキスト化）
+        context: dict[str, str] = {}
+        logger.info(f"Required inputs: {required_inputs}")
+
+        for inp in required_inputs:
+            key = inp["key"]
+            input_type = inp["type"]
+            label = inp["label"]
+
+            try:
+                if input_type == "file":
+                    # PDFファイルからテキスト抽出
+                    logger.info(f"Looking for file with key '{key}' in file_map")
+                    if key in file_map:
+                        file = file_map[key]
+                        content = await file.read()
+                        logger.info(f"Read {len(content)} bytes from file")
+                        text = extract_text_from_pdf(io.BytesIO(content))
+                        context[key] = text
+                        logger.info(f"Extracted text from PDF '{label}': {len(text)} chars")
+                    else:
+                        logger.warning(f"File not found for key '{key}'. Available keys: {list(file_map.keys())}")
+                        context[key] = f"（{label}のファイルが見つかりませんでした）"
+
+                elif input_type == "url":
+                    # URLからコンテンツ取得
+                    url = input_values.get(key, "")
+                    if url:
+                        # Google Sheetsの場合は専用サービスを使用
+                        from services.sheet_service import is_google_sheets_url, read_public_sheet, format_csv_for_prompt
+                        if is_google_sheets_url(url):
+                            try:
+                                csv_text = read_public_sheet(url)
+                                text = format_csv_for_prompt(csv_text)
+                                logger.info(f"Fetched Google Sheet from '{url}': {len(text)} chars")
+                            except ValueError as e:
+                                text = f"（スプレッドシートの読み込みに失敗しました: {str(e)}）"
+                                logger.warning(f"Failed to read Google Sheet: {e}")
+                        else:
+                            text = fetch_web_content(url)
+                            logger.info(f"Fetched web content from '{url}': {len(text)} chars")
+                        context[key] = text
+                    else:
+                        context[key] = f"（{label}のURLが入力されていません）"
+
+                elif input_type == "text":
+                    # テキストをそのまま使用
+                    context[key] = input_values.get(key, "")
+
+            except Exception as e:
+                logger.error(f"Error processing input '{key}': {e}")
+                context[key] = f"（{label}の読み込みに失敗しました: {str(e)}）"
+
+        # 2. タスクを順次実行
+        task_results: list[ExecuteProjectTaskResult] = []
+        previous_output = ""
+
+        # Bedrockクライアント
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+        for idx, task in enumerate(tasks):
+            role = task["role"]
+            crew_id = task["assigned_crew_id"]
+            crew_name = task["assigned_crew_name"]
+            crew_image = task["assigned_crew_image"]
+            instruction = task["instruction"]
+
+            # クルー情報を取得（性格など）
+            crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+            personality = crew.personality if crew else ""
+
+            # 変数置換: {key} を context[key] で置換
+            processed_instruction = instruction
+            for key, value in context.items():
+                processed_instruction = processed_instruction.replace(f"{{{key}}}", value)
+
+            # プロンプト構築
+            system_prompt = f"""あなたは「{crew_name}」という名前のクルー（社員）です。
+役割: {role}
+性格: {personality}
+
+あなたはプロジェクトチームの一員として、与えられたタスクを遂行してください。
+前のタスクの成果物がある場合は、それを参考にして作業を進めてください。"""
+
+            user_prompt = f"""## あなたのタスク
+{processed_instruction}
+
+"""
+            if previous_output:
+                user_prompt += f"""## 前のタスクの成果物
+{previous_output}
+
+"""
+            user_prompt += "上記の指示に従って、タスクを実行してください。"
+
+            try:
+                # Bedrock呼び出し
+                body = json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 4096,
+                    "system": system_prompt,
+                    "messages": [
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.7,
+                })
+
+                response = bedrock.invoke_model(
+                    modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+                    body=body
+                )
+
+                response_body = json.loads(response["body"].read())
+                result_text = response_body["content"][0]["text"]
+
+                # 結果を保存
+                task_results.append(ExecuteProjectTaskResult(
+                    task_index=idx,
+                    role=role,
+                    crew_name=crew_name,
+                    crew_image=crew_image,
+                    instruction=instruction,
+                    result=result_text,
+                    status="completed"
+                ))
+
+                # 次のタスクへの引き継ぎ
+                previous_output = result_text
+
+                logger.info(f"Task {idx + 1} completed: {role} by {crew_name}")
+
+            except Exception as e:
+                logger.error(f"Error executing task {idx + 1}: {e}")
+                task_results.append(ExecuteProjectTaskResult(
+                    task_index=idx,
+                    role=role,
+                    crew_name=crew_name,
+                    crew_image=crew_image,
+                    instruction=instruction,
+                    result=f"エラーが発生しました: {str(e)}",
+                    status="error"
+                ))
+                # エラーでも次のタスクは続行
+                previous_output = f"（前のタスクでエラーが発生しました: {str(e)}）"
+
+        logger.info(f"Project execution completed: {project_title}")
+
+        # 3. Slack通知を送信（指示に「Slack」が含まれている場合のみ）
+        # ユーザーの目標やタスクの指示に「Slack」「slack」が含まれているかチェック
+        should_notify_slack = False
+        slack_keywords = ["slack", "Slack", "SLACK", "スラック"]
+
+        # ユーザーゴールをチェック
+        if any(keyword in user_goal for keyword in slack_keywords):
+            should_notify_slack = True
+
+        # タスクの指示をチェック
+        if not should_notify_slack:
+            for task in tasks:
+                if any(keyword in task.get("instruction", "") for keyword in slack_keywords):
+                    should_notify_slack = True
+                    break
+
+        if should_notify_slack:
+            try:
+                from services.slack_service import send_project_completion
+                task_summaries = [
+                    {
+                        "role": r.role,
+                        "crew_name": r.crew_name,
+                        "result": r.result
+                    }
+                    for r in task_results
+                ]
+                send_project_completion(project_title, task_summaries)
+                logger.info("Slack notification sent (keyword detected in instructions)")
+            except Exception as slack_error:
+                logger.warning(f"Failed to send Slack notification: {slack_error}")
+        else:
+            logger.info("Slack notification skipped (no 'Slack' keyword in instructions)")
+
+        return ExecuteProjectResponse(
+            success=True,
+            project_title=project_title,
+            task_results=task_results,
+        )
+
+    except Exception as e:
+        logger.error(f"Execute project error: {e}")
+        return ExecuteProjectResponse(
+            success=False,
+            error=f"プロジェクトの実行に失敗しました: {str(e)}",
+        )
