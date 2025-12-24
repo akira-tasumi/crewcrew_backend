@@ -33,3 +33,5 @@ onnxruntime==1.17.1
 
 # YouTube Transcript
 youtube-transcript-api==0.6.3
+
+numpy<2.0.0
