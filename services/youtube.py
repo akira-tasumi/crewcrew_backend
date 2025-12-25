@@ -269,6 +269,194 @@ def _fetch_captions_via_timedtext(video_id: str, lang: str = None) -> list[dict]
         return None
 
 
+def _fetch_with_innertube(video_id: str) -> list[dict] | None:
+    """
+    YouTube InnerTube APIを使用して字幕を取得
+    複数のクライアントタイプを試す
+    """
+    # 試すクライアント設定のリスト
+    client_configs = [
+        # iOS client - 最も緩い制限
+        {
+            "name": "iOS",
+            "payload": {
+                "context": {
+                    "client": {
+                        "hl": "ja",
+                        "gl": "JP",
+                        "clientName": "IOS",
+                        "clientVersion": "19.09.3",
+                        "deviceModel": "iPhone14,3",
+                        "userAgent": "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)"
+                    }
+                },
+                "videoId": video_id,
+                "contentCheckOk": True,
+                "racyCheckOk": True
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)",
+                "X-YouTube-Client-Name": "5",
+                "X-YouTube-Client-Version": "19.09.3",
+            }
+        },
+        # Android client
+        {
+            "name": "Android",
+            "payload": {
+                "context": {
+                    "client": {
+                        "hl": "ja",
+                        "gl": "JP",
+                        "clientName": "ANDROID",
+                        "clientVersion": "19.09.37",
+                        "androidSdkVersion": 30,
+                        "userAgent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
+                    }
+                },
+                "videoId": video_id,
+                "contentCheckOk": True,
+                "racyCheckOk": True
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+                "X-YouTube-Client-Name": "3",
+                "X-YouTube-Client-Version": "19.09.37",
+            }
+        },
+        # Web client (TV埋め込み - 制限が緩い)
+        {
+            "name": "TV Embed",
+            "payload": {
+                "context": {
+                    "client": {
+                        "hl": "ja",
+                        "gl": "JP",
+                        "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                        "clientVersion": "2.0",
+                    }
+                },
+                "videoId": video_id,
+                "contentCheckOk": True,
+                "racyCheckOk": True
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+        },
+    ]
+
+    api_url = "https://www.youtube.com/youtubei/v1/player"
+
+    for config in client_configs:
+        try:
+            print(f"[YouTube] InnerTube: Trying {config['name']} client...")
+
+            response = requests.post(
+                api_url,
+                json=config["payload"],
+                headers=config["headers"],
+                timeout=15
+            )
+
+            if response.status_code != 200:
+                print(f"[YouTube] InnerTube {config['name']}: HTTP {response.status_code}")
+                continue
+
+            data = response.json()
+
+            # playabilityStatusをチェック
+            playability = data.get("playabilityStatus", {})
+            status = playability.get("status", "")
+            if status != "OK":
+                reason = playability.get("reason", "Unknown")
+                print(f"[YouTube] InnerTube {config['name']}: {status} - {reason}")
+                continue
+
+            # 字幕トラック情報を取得
+            captions = data.get("captions", {})
+            player_captions = captions.get("playerCaptionsTracklistRenderer", {})
+            caption_tracks = player_captions.get("captionTracks", [])
+
+            if not caption_tracks:
+                print(f"[YouTube] InnerTube {config['name']}: No caption tracks")
+                continue
+
+            # 優先順位: 日本語 → 英語 → 最初のトラック
+            selected_track = None
+            for preferred_lang in ["ja", "en"]:
+                for track in caption_tracks:
+                    lang_code = track.get("languageCode", "")
+                    if lang_code == preferred_lang:
+                        selected_track = track
+                        break
+                if selected_track:
+                    break
+
+            if not selected_track and caption_tracks:
+                selected_track = caption_tracks[0]
+
+            if not selected_track:
+                continue
+
+            caption_url = selected_track.get("baseUrl", "")
+            lang_code = selected_track.get("languageCode", "unknown")
+
+            if not caption_url:
+                print(f"[YouTube] InnerTube {config['name']}: No caption URL")
+                continue
+
+            print(f"[YouTube] InnerTube {config['name']}: Found {lang_code} caption, fetching...")
+
+            # 字幕をXML形式で取得
+            caption_response = requests.get(caption_url, timeout=10)
+
+            if caption_response.status_code != 200:
+                print(f"[YouTube] InnerTube: Caption fetch failed: {caption_response.status_code}")
+                continue
+
+            # XMLをパース (複数のフォーマットに対応)
+            try:
+                import xml.etree.ElementTree as ET
+                import html as html_module
+                root = ET.fromstring(caption_response.text)
+                texts = []
+
+                # フォーマット1: <text> 要素
+                for text_elem in root.findall('.//text'):
+                    text = text_elem.text
+                    if text:
+                        decoded_text = html_module.unescape(text.strip())
+                        if decoded_text:
+                            texts.append(decoded_text)
+
+                # フォーマット2: <p> 要素 (timedtext format="3")
+                if not texts:
+                    for p_elem in root.findall('.//p'):
+                        text = p_elem.text
+                        if text:
+                            decoded_text = html_module.unescape(text.strip())
+                            if decoded_text:
+                                texts.append(decoded_text)
+
+                if texts:
+                    print(f"[YouTube] InnerTube {config['name']}: Success ({len(texts)} segments)")
+                    return [{"text": " ".join(texts)}]
+            except Exception as e:
+                print(f"[YouTube] InnerTube XML parse error: {e}")
+                continue
+
+        except Exception as e:
+            print(f"[YouTube] InnerTube {config['name']} error: {e}")
+            continue
+
+    print(f"[YouTube] InnerTube: All clients failed")
+    return None
+
+
 def _fetch_captions_from_page(video_id: str) -> list[dict] | None:
     """
     YouTubeのページHTMLから字幕URLを抽出して取得する
@@ -290,21 +478,62 @@ def _fetch_captions_from_page(video_id: str) -> list[dict] | None:
 
         html = response.text
 
-        # ytInitialPlayerResponse からJSON部分を抽出
-        pattern = r'ytInitialPlayerResponse\s*=\s*(\{.+?\});'
-        match = re.search(pattern, html)
+        # ytInitialPlayerResponse を探す（より堅牢なパターン）
+        # パターン1: 直接の代入
+        start_marker = 'ytInitialPlayerResponse = '
+        start_idx = html.find(start_marker)
 
-        if not match:
-            # 別のパターンも試す
-            pattern2 = r'var\s+ytInitialPlayerResponse\s*=\s*(\{.+?\});'
-            match = re.search(pattern2, html)
+        if start_idx == -1:
+            # パターン2: varを使った代入
+            start_marker = 'var ytInitialPlayerResponse = '
+            start_idx = html.find(start_marker)
 
-        if not match:
+        if start_idx == -1:
             print(f"[YouTube] Could not find ytInitialPlayerResponse in page")
             return None
 
+        start_idx += len(start_marker)
+
+        # ブラケットのバランスを取ってJSON終端を見つける
+        bracket_count = 0
+        end_idx = start_idx
+        in_string = False
+        escape_next = False
+
+        for i in range(start_idx, min(start_idx + 500000, len(html))):
+            char = html[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == '\\':
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if char == '{':
+                bracket_count += 1
+            elif char == '}':
+                bracket_count -= 1
+                if bracket_count == 0:
+                    end_idx = i + 1
+                    break
+
+        if end_idx <= start_idx:
+            print(f"[YouTube] Could not find end of ytInitialPlayerResponse JSON")
+            return None
+
+        json_str = html[start_idx:end_idx]
+
         try:
-            player_response = json.loads(match.group(1))
+            player_response = json.loads(json_str)
         except json.JSONDecodeError as e:
             print(f"[YouTube] Failed to parse player response: {e}")
             return None
@@ -343,53 +572,79 @@ def _fetch_captions_from_page(video_id: str) -> list[dict] | None:
             print(f"[YouTube] No caption URL found")
             return None
 
-        # JSON形式で取得するためにfmt=json3を追加
-        if "fmt=" not in caption_url:
-            caption_url += "&fmt=json3"
-        else:
-            caption_url = re.sub(r'fmt=\w+', 'fmt=json3', caption_url)
+        print(f"[YouTube] Found {lang_code} caption track, fetching from: {caption_url[:80]}...")
 
-        print(f"[YouTube] Found {lang_code} caption track, fetching...")
-
-        # 字幕データを取得
+        # 字幕データを取得（デフォルト形式で試す）
         caption_response = requests.get(caption_url, headers=headers, timeout=10)
 
         if caption_response.status_code != 200:
             print(f"[YouTube] Caption fetch failed: {caption_response.status_code}")
             return None
 
+        # レスポンスが空かチェック
+        if not caption_response.text.strip():
+            print(f"[YouTube] Caption response is empty")
+            return None
+
+        # まずXMLとして試す（デフォルト形式、複数フォーマット対応）
         try:
-            caption_data = caption_response.json()
-            events = caption_data.get("events", [])
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(caption_response.text)
+            texts = []
 
-            if events:
-                texts = []
-                for event in events:
-                    segs = event.get("segs", [])
-                    for seg in segs:
-                        text = seg.get("utf8", "").strip()
-                        if text and text != "\n":
-                            texts.append(text)
+            # フォーマット1: <text> 要素
+            for text_elem in root.findall('.//text'):
+                text = text_elem.text
+                if text:
+                    # HTMLエンティティをデコード
+                    import html
+                    decoded_text = html.unescape(text.strip())
+                    if decoded_text:
+                        texts.append(decoded_text)
 
-                if texts:
-                    print(f"[YouTube] Page scrape: Found {lang_code} captions ({len(texts)} segments)")
-                    return [{"text": " ".join(texts)}]
-        except json.JSONDecodeError:
-            # XMLとして試す
-            try:
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(caption_response.text)
-                texts = []
-                for text_elem in root.findall('.//text'):
-                    text = text_elem.text
+            # フォーマット2: <p> 要素 (timedtext format="3")
+            if not texts:
+                for p_elem in root.findall('.//p'):
+                    text = p_elem.text
                     if text:
-                        texts.append(text.strip())
+                        import html
+                        decoded_text = html.unescape(text.strip())
+                        if decoded_text:
+                            texts.append(decoded_text)
 
-                if texts:
-                    print(f"[YouTube] Page scrape: Found {lang_code} captions (XML format)")
-                    return [{"text": " ".join(texts)}]
-            except Exception:
-                pass
+            if texts:
+                print(f"[YouTube] Page scrape: Found {lang_code} captions (XML format, {len(texts)} segments)")
+                return [{"text": " ".join(texts)}]
+        except Exception as xml_err:
+            print(f"[YouTube] XML parse failed: {xml_err}")
+
+        # JSON形式で再試行
+        json_url = caption_url
+        if "fmt=" not in json_url:
+            json_url += "&fmt=json3"
+        else:
+            json_url = re.sub(r'fmt=\w+', 'fmt=json3', json_url)
+
+        try:
+            json_response = requests.get(json_url, headers=headers, timeout=10)
+            if json_response.status_code == 200 and json_response.text.strip():
+                caption_data = json_response.json()
+                events = caption_data.get("events", [])
+
+                if events:
+                    texts = []
+                    for event in events:
+                        segs = event.get("segs", [])
+                        for seg in segs:
+                            text = seg.get("utf8", "").strip()
+                            if text and text != "\n":
+                                texts.append(text)
+
+                    if texts:
+                        print(f"[YouTube] Page scrape: Found {lang_code} captions (JSON format, {len(texts)} segments)")
+                        return [{"text": " ".join(texts)}]
+        except Exception as json_err:
+            print(f"[YouTube] JSON parse failed: {json_err}")
 
         print(f"[YouTube] Page scrape: Could not parse captions")
         return None
@@ -572,11 +827,12 @@ def get_video_transcript(video_id: str) -> str | None:
     動画IDから字幕テキストを取得する
 
     優先順位:
-    1. pytubefix (最も信頼性が高い、AWS環境でも動作)
-    2. ページスクレイピング（ytInitialPlayerResponseから直接URL取得）
-    3. YouTube Data API + timedtext API
-    4. youtube-transcript-api
-    5. yt-dlp フォールバック
+    1. pytubefix (最も信頼性が高い)
+    2. InnerTube API (Android clientでAWS環境でも動作する可能性)
+    3. ページスクレイピング（ytInitialPlayerResponseから直接URL取得）
+    4. YouTube Data API + timedtext API
+    5. youtube-transcript-api
+    6. yt-dlp フォールバック
 
     Args:
         video_id: YouTube動画ID
@@ -590,20 +846,27 @@ def get_video_transcript(video_id: str) -> str | None:
         transcript_data = None
         used_method = None
 
-        # 1. まずpytubefixを試す（AWS環境で最も信頼性が高い）
+        # 1. まずpytubefixを試す
         print(f"[YouTube] Trying pytubefix...")
         transcript_data = _fetch_with_pytubefix(video_id)
         if transcript_data:
             used_method = "pytubefix"
 
-        # 2. ページスクレイピングを試す
+        # 2. InnerTube APIを試す（AWS環境でも動作する可能性が高い）
+        if not transcript_data:
+            print(f"[YouTube] Trying InnerTube API (Android client)...")
+            transcript_data = _fetch_with_innertube(video_id)
+            if transcript_data:
+                used_method = "InnerTube API"
+
+        # 3. ページスクレイピングを試す
         if not transcript_data:
             print(f"[YouTube] Trying page scraping (ytInitialPlayerResponse)...")
             transcript_data = _fetch_captions_from_page(video_id)
             if transcript_data:
                 used_method = "page scraping"
 
-        # 3. YouTube Data API / timedtext APIを試す
+        # 4. YouTube Data API / timedtext APIを試す
         if not transcript_data:
             print(f"[YouTube] Trying YouTube Data API / timedtext...")
             transcript_data = _fetch_with_youtube_data_api(video_id)
@@ -615,7 +878,7 @@ def get_video_transcript(video_id: str) -> str | None:
                 if transcript_data:
                     used_method = "timedtext API"
 
-        # 4. youtube-transcript-api を試す
+        # 5. youtube-transcript-api を試す
         if not transcript_data:
             print(f"[YouTube] Trying youtube-transcript-api...")
             languages_to_try = [['ja'], ['en'], None]
@@ -636,7 +899,7 @@ def get_video_transcript(video_id: str) -> str | None:
                     print(f"[YouTube] transcript-api error with lang={lang}: {type(e).__name__}: {e}")
                     continue
 
-        # 5. yt-dlp フォールバック
+        # 6. yt-dlp フォールバック
         if not transcript_data:
             print(f"[YouTube] Trying yt-dlp fallback...")
             transcript_data = _fetch_with_ytdlp(video_id)
