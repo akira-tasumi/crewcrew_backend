@@ -66,9 +66,6 @@ def get_video_transcript(video_id: str) -> str | None:
     try:
         print(f"[YouTube] Fetching transcript for video_id: {video_id}")
 
-        # YouTubeTranscriptApi インスタンスを作成
-        ytt_api = YouTubeTranscriptApi()
-
         # 日本語優先、次に英語、それ以外は自動
         languages_to_try = [['ja'], ['en'], None]
 
@@ -78,10 +75,11 @@ def get_video_transcript(video_id: str) -> str | None:
         for lang in languages_to_try:
             try:
                 if lang:
-                    transcript_data = ytt_api.fetch(video_id, languages=lang)
+                    # 旧API (クラスメソッド) を使用
+                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=lang)
                     used_language = lang[0]
                 else:
-                    transcript_data = ytt_api.fetch(video_id)
+                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
                     used_language = "auto"
                 print(f"[YouTube] Found {used_language} transcript")
                 break
@@ -93,8 +91,8 @@ def get_video_transcript(video_id: str) -> str | None:
             print(f"[YouTube] No transcript available for video_id: {video_id}")
             return None
 
-        # 字幕データを連結（FetchedTranscriptはイテラブル）
-        full_text = " ".join([snippet.text for snippet in transcript_data])
+        # 字幕データを連結（辞書のリスト形式）
+        full_text = " ".join([snippet['text'] for snippet in transcript_data])
 
         # トークン制限対策: 長すぎる場合は先頭5000文字でカット
         if len(full_text) > 5000:
