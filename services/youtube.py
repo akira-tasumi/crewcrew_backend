@@ -3,17 +3,22 @@ YouTube字幕取得サービス
 
 YouTubeの動画URLから字幕（Transcript）を取得する機能を提供。
 複数の方法でフォールバック:
-1. youtube-transcript-api (新API)
-2. youtube-transcript-api (旧API)
-3. yt-dlp (より堅牢、AWS環境での制限回避)
+1. YouTube Data API v3 (公式API、最も信頼性が高い)
+2. youtube-transcript-api (新API)
+3. youtube-transcript-api (旧API)
+4. yt-dlp (より堅牢、AWS環境での制限回避)
 """
 
 import re
 import subprocess
 import json
 import os
+import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+
+# YouTube Data API v3 キー（環境変数から取得、なければデフォルト）
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyC_n8S8GymsPstVbqkkMLWQJXYELLtqBWI")
 
 
 def extract_video_id(url: str) -> str | None:
@@ -53,6 +58,157 @@ def extract_video_id(url: str) -> str | None:
             return match.group(1)
 
     return None
+
+
+def _fetch_with_youtube_data_api(video_id: str) -> list[dict] | None:
+    """
+    YouTube Data API v3を使って字幕を取得する
+    公式APIなのでIPブロックされにくい
+    """
+    if not YOUTUBE_API_KEY:
+        print("[YouTube] No API key configured")
+        return None
+
+    try:
+        # 1. 字幕トラック一覧を取得
+        captions_url = "https://www.googleapis.com/youtube/v3/captions"
+        params = {
+            "part": "snippet",
+            "videoId": video_id,
+            "key": YOUTUBE_API_KEY
+        }
+
+        response = requests.get(captions_url, params=params, timeout=10)
+
+        if response.status_code == 403:
+            print(f"[YouTube] Data API: Access forbidden (may need OAuth for caption download)")
+            # 字幕ダウンロードにはOAuthが必要なため、代替手段を試す
+            return _fetch_captions_via_timedtext(video_id)
+
+        if response.status_code != 200:
+            print(f"[YouTube] Data API error: {response.status_code} - {response.text}")
+            return None
+
+        data = response.json()
+        items = data.get("items", [])
+
+        if not items:
+            print(f"[YouTube] Data API: No captions found for video {video_id}")
+            return None
+
+        # 日本語 → 英語 → その他の順で優先
+        caption_id = None
+        caption_lang = None
+
+        for preferred_lang in ["ja", "en"]:
+            for item in items:
+                lang = item.get("snippet", {}).get("language", "")
+                if lang == preferred_lang:
+                    caption_id = item.get("id")
+                    caption_lang = lang
+                    break
+            if caption_id:
+                break
+
+        # 見つからなければ最初の字幕を使用
+        if not caption_id and items:
+            caption_id = items[0].get("id")
+            caption_lang = items[0].get("snippet", {}).get("language", "unknown")
+
+        if not caption_id:
+            return None
+
+        print(f"[YouTube] Data API: Found {caption_lang} caption track")
+
+        # 2. 字幕をダウンロード（注意: 公開字幕のダウンロードにはOAuth認証が必要）
+        # 代わりにtimedtext APIを試す
+        return _fetch_captions_via_timedtext(video_id, caption_lang)
+
+    except requests.RequestException as e:
+        print(f"[YouTube] Data API request error: {e}")
+        return None
+    except Exception as e:
+        print(f"[YouTube] Data API error: {e}")
+        return None
+
+
+def _fetch_captions_via_timedtext(video_id: str, lang: str = None) -> list[dict] | None:
+    """
+    YouTubeのtimedtext APIを使って字幕を直接取得する
+    これは非公式だが、APIキーなしでも動作する場合がある
+    """
+    try:
+        # 試す言語のリスト
+        langs_to_try = [lang] if lang else []
+        langs_to_try.extend(["ja", "en", ""])
+
+        for try_lang in langs_to_try:
+            # timedtext API URL
+            if try_lang:
+                url = f"https://www.youtube.com/api/timedtext?v={video_id}&lang={try_lang}&fmt=json3"
+            else:
+                url = f"https://www.youtube.com/api/timedtext?v={video_id}&fmt=json3"
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "ja,en;q=0.9",
+            }
+
+            response = requests.get(url, headers=headers, timeout=10)
+
+            if response.status_code == 200 and response.text.strip():
+                try:
+                    data = response.json()
+                    events = data.get("events", [])
+
+                    if events:
+                        # 字幕テキストを抽出
+                        texts = []
+                        for event in events:
+                            segs = event.get("segs", [])
+                            for seg in segs:
+                                text = seg.get("utf8", "").strip()
+                                if text and text != "\n":
+                                    texts.append(text)
+
+                        if texts:
+                            print(f"[YouTube] timedtext API: Found {try_lang or 'auto'} captions ({len(texts)} segments)")
+                            return [{"text": " ".join(texts)}]
+                except json.JSONDecodeError:
+                    continue
+
+        # 自動生成字幕も試す
+        for try_lang in ["ja", "en"]:
+            url = f"https://www.youtube.com/api/timedtext?v={video_id}&lang={try_lang}&kind=asr&fmt=json3"
+
+            response = requests.get(url, headers=headers, timeout=10)
+
+            if response.status_code == 200 and response.text.strip():
+                try:
+                    data = response.json()
+                    events = data.get("events", [])
+
+                    if events:
+                        texts = []
+                        for event in events:
+                            segs = event.get("segs", [])
+                            for seg in segs:
+                                text = seg.get("utf8", "").strip()
+                                if text and text != "\n":
+                                    texts.append(text)
+
+                        if texts:
+                            print(f"[YouTube] timedtext API: Found {try_lang} auto-generated captions")
+                            return [{"text": " ".join(texts)}]
+                except json.JSONDecodeError:
+                    continue
+
+        print(f"[YouTube] timedtext API: No captions found")
+        return None
+
+    except Exception as e:
+        print(f"[YouTube] timedtext API error: {e}")
+        return None
 
 
 def _fetch_with_new_api(video_id: str, languages: list[str] | None) -> list[dict] | None:
@@ -225,8 +381,9 @@ def get_video_transcript(video_id: str) -> str | None:
     動画IDから字幕テキストを取得する
 
     優先順位:
-    1. youtube-transcript-api (日本語 → 英語 → 自動)
-    2. yt-dlp フォールバック (AWS環境での制限回避用)
+    1. YouTube Data API + timedtext API (AWS環境で最も信頼性が高い)
+    2. youtube-transcript-api (日本語 → 英語 → 自動)
+    3. yt-dlp フォールバック
 
     Args:
         video_id: YouTube動画ID
@@ -237,40 +394,47 @@ def get_video_transcript(video_id: str) -> str | None:
     try:
         print(f"[YouTube] Fetching transcript for video_id: {video_id}")
 
-        # 日本語優先、次に英語、それ以外は自動
-        languages_to_try = [['ja'], ['en'], None]
-
         transcript_data = None
-        used_language = None
-        api_failed = False
+        used_method = None
 
-        for lang in languages_to_try:
-            try:
-                # 新しいAPIを試す
-                transcript_data = _fetch_with_new_api(video_id, lang)
-                if transcript_data is None:
-                    # 旧APIを試す
-                    transcript_data = _fetch_with_old_api(video_id, lang)
+        # 1. まずYouTube Data API / timedtext APIを試す（AWS環境で有効）
+        print(f"[YouTube] Trying YouTube Data API / timedtext...")
+        transcript_data = _fetch_with_youtube_data_api(video_id)
+        if transcript_data:
+            used_method = "YouTube Data API"
+        else:
+            # timedtext APIを直接試す
+            transcript_data = _fetch_captions_via_timedtext(video_id)
+            if transcript_data:
+                used_method = "timedtext API"
 
-                if transcript_data:
-                    used_language = lang[0] if lang else "auto"
-                    print(f"[YouTube] Found {used_language} transcript via API")
-                    break
-            except (TranscriptsDisabled, NoTranscriptFound) as e:
-                print(f"[YouTube] API failed with lang={lang}: {type(e).__name__}")
-                api_failed = True
-                continue
-            except Exception as e:
-                print(f"[YouTube] Failed to fetch with lang={lang}: {type(e).__name__}: {e}")
-                api_failed = True
-                continue
+        # 2. youtube-transcript-api を試す
+        if not transcript_data:
+            print(f"[YouTube] Trying youtube-transcript-api...")
+            languages_to_try = [['ja'], ['en'], None]
 
-        # youtube-transcript-api が失敗した場合、yt-dlp を試す
-        if not transcript_data and api_failed:
+            for lang in languages_to_try:
+                try:
+                    transcript_data = _fetch_with_new_api(video_id, lang)
+                    if transcript_data is None:
+                        transcript_data = _fetch_with_old_api(video_id, lang)
+
+                    if transcript_data:
+                        used_method = f"transcript-api ({lang[0] if lang else 'auto'})"
+                        break
+                except (TranscriptsDisabled, NoTranscriptFound) as e:
+                    print(f"[YouTube] transcript-api failed with lang={lang}: {type(e).__name__}")
+                    continue
+                except Exception as e:
+                    print(f"[YouTube] transcript-api error with lang={lang}: {type(e).__name__}: {e}")
+                    continue
+
+        # 3. yt-dlp フォールバック
+        if not transcript_data:
             print(f"[YouTube] Trying yt-dlp fallback...")
             transcript_data = _fetch_with_ytdlp(video_id)
             if transcript_data:
-                used_language = "yt-dlp"
+                used_method = "yt-dlp"
 
         if not transcript_data:
             print(f"[YouTube] No transcript available for video_id: {video_id}")
@@ -284,41 +448,11 @@ def get_video_transcript(video_id: str) -> str | None:
             print(f"[YouTube] Transcript truncated from {len(full_text)} to 5000 chars")
             full_text = full_text[:5000]
 
-        print(f"[YouTube] Successfully fetched transcript ({len(full_text)} chars, method: {used_language})")
+        print(f"[YouTube] Successfully fetched transcript ({len(full_text)} chars, method: {used_method})")
         return full_text
 
-    except TranscriptsDisabled:
-        print(f"[YouTube] Transcripts are disabled for video_id: {video_id}")
-        # yt-dlp フォールバック
-        print(f"[YouTube] Trying yt-dlp fallback...")
-        transcript_data = _fetch_with_ytdlp(video_id)
-        if transcript_data:
-            full_text = " ".join([snippet['text'] for snippet in transcript_data])
-            if len(full_text) > 5000:
-                full_text = full_text[:5000]
-            return full_text
-        return None
-    except NoTranscriptFound:
-        print(f"[YouTube] No transcript found for video_id: {video_id}")
-        # yt-dlp フォールバック
-        print(f"[YouTube] Trying yt-dlp fallback...")
-        transcript_data = _fetch_with_ytdlp(video_id)
-        if transcript_data:
-            full_text = " ".join([snippet['text'] for snippet in transcript_data])
-            if len(full_text) > 5000:
-                full_text = full_text[:5000]
-            return full_text
-        return None
     except Exception as e:
-        print(f"[YouTube] Transcript Error: {e}")
-        # yt-dlp フォールバック
-        print(f"[YouTube] Trying yt-dlp fallback...")
-        transcript_data = _fetch_with_ytdlp(video_id)
-        if transcript_data:
-            full_text = " ".join([snippet['text'] for snippet in transcript_data])
-            if len(full_text) > 5000:
-                full_text = full_text[:5000]
-            return full_text
+        print(f"[YouTube] Unexpected error: {e}")
         return None
 
 
