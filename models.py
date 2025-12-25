@@ -59,6 +59,7 @@ class Crew(Base):
     level: Mapped[int] = mapped_column(Integer, default=1)
     exp: Mapped[int] = mapped_column(Integer, default=0)
     image_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    image_base64: Mapped[str | None] = mapped_column(Text, nullable=True)  # Base64画像データ（本番環境用）
     personality: Mapped[str] = mapped_column(Text, nullable=True)
     is_partner: Mapped[bool] = mapped_column(Boolean, default=False)  # 相棒フラグ
     rarity: Mapped[int] = mapped_column(Integer, default=1)  # レアリティ（★1〜★5）

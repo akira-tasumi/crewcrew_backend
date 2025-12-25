@@ -296,7 +296,8 @@ async def get_crews(db: Session = Depends(get_db)) -> list[CrewResponse]:
             role=crew.role,
             level=crew.level,
             exp=crew.exp,
-            image=crew.image_url,
+            # Base64がある場合はそれを優先、なければimage_urlを使用
+            image=crew.image_base64 if crew.image_base64 else crew.image_url,
             personality=crew.personality,
             is_partner=crew.is_partner,
             rarity=crew.rarity,
@@ -468,20 +469,22 @@ async def create_crew(
     user.coin -= CREATE_COST
 
     # 画像の決定：指定があればそれを使用、なければAI生成
+    image_base64 = None
     if request.image:
         image_url = request.image
         logger.info(f"Using specified image: {image_url}")
     else:
         # Nova Canvas で画像を生成（失敗時はデフォルト画像）
         logger.info(f"Generating image for crew: {request.name}")
-        image_url = await generate_crew_image_with_fallback(request.name)
-        logger.info(f"Generated image: {image_url}")
+        image_url, image_base64 = await generate_crew_image_with_fallback(request.name)
+        logger.info(f"Generated image: {image_url}, base64: {'Yes' if image_base64 else 'No'}")
 
     new_crew = CrewModel(
         name=request.name,
         role=request.role,
         personality=personality,
         image_url=image_url,
+        image_base64=image_base64,
         level=1,
         exp=0,
         rarity=1,  # 自由作成は★1固定
@@ -647,7 +650,8 @@ async def get_partner(db: Session = Depends(get_db)) -> PartnerResponse | None:
         name=partner.name,
         role=partner.role,
         level=partner.level,
-        image=partner.image_url,
+        # Base64がある場合はそれを優先
+        image=partner.image_base64 if partner.image_base64 else partner.image_url,
         personality=partner.personality,
         greeting=greeting,
     )
@@ -1096,7 +1100,7 @@ async def scout_crew(
 
     # AI画像生成（レアリティを渡す）
     logger.info(f"Scouting new crew: {name} (Role: {role}, Personality: {personality_key}, ★{rarity})")
-    image_url = await generate_crew_image_with_fallback(name, rarity)
+    image_url, image_base64 = await generate_crew_image_with_fallback(name, rarity)
 
     # クルーをDBに保存
     new_crew = CrewModel(
@@ -1104,6 +1108,7 @@ async def scout_crew(
         role=role,
         personality=personality_key,  # キーを保存
         image_url=image_url,
+        image_base64=image_base64,
         level=1,
         exp=0,
         rarity=rarity,
@@ -1148,7 +1153,8 @@ async def scout_crew(
             role_label=role_label,
             level=new_crew.level,
             exp=new_crew.exp,
-            image=new_crew.image_url,
+            # Base64がある場合はそれを優先
+            image=new_crew.image_base64 if new_crew.image_base64 else new_crew.image_url,
             personality=personality_key,
             personality_label=personality_label,
             rarity=new_crew.rarity,

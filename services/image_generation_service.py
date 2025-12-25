@@ -191,26 +191,25 @@ def remove_background(image: Image.Image) -> Image.Image:
     return Image.open(io.BytesIO(output_bytes))
 
 
-async def generate_crew_image(crew_name: str, rarity: int = 1) -> str:
+async def generate_crew_image(crew_name: str, rarity: int = 1) -> tuple[str, str | None]:
     """
     クルー用の画像を生成する
 
     1. ベース画像をランダムに選択
     2. Nova Canvas で Image-to-Image 変換
     3. rembg で背景透過
-    4. 保存してパスを返す
+    4. Base64データを返す（本番環境対応）
 
     Args:
         crew_name: クルーの名前（ログ用）
         rarity: レアリティ（1-5）。高いほど豪華な画像を生成
 
     Returns:
-        str: 生成された画像の相対パス（/images/crews/generated/xxx.png）
+        tuple: (image_url, image_base64)
+            - image_url: フォールバック用のデフォルト画像パス
+            - image_base64: 生成された画像のBase64データ（data:image/png;base64,... 形式）
     """
     try:
-        # 出力ディレクトリを作成
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
         # ベース画像を選択
         base_image_path = get_random_base_image()
         logger.info(f"Selected base image: {base_image_path.name}")
@@ -227,20 +226,19 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> str:
         client = get_bedrock_client()
 
         # Nova Canvas Image-to-Image リクエスト
-        # Nova Canvas はネガティブプロンプトに対応している
         request_body = {
             "taskType": "IMAGE_VARIATION",
             "imageVariationParams": {
                 "images": [base_image_b64],
                 "text": positive_prompt,
-                "negativeText": negative_prompt,  # ネガティブプロンプト
-                "similarityStrength": 0.6,  # 元画像との類似度を少し下げて3D感を出す
+                "negativeText": negative_prompt,
+                "similarityStrength": 0.6,
             },
             "imageGenerationConfig": {
                 "numberOfImages": 1,
                 "width": 512,
                 "height": 512,
-                "cfgScale": 9.0,  # CFGスケールを上げてプロンプトへの忠実度を高める
+                "cfgScale": 9.0,
             }
         }
 
@@ -267,16 +265,20 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> str:
         # 背景を透過
         transparent_image = remove_background(generated_image)
 
-        # ファイルを保存
-        file_name = f"{uuid.uuid4()}.png"
-        output_path = OUTPUT_DIR / file_name
-        transparent_image.save(output_path, "PNG")
+        # PNG形式でBase64エンコード
+        img_byte_arr = io.BytesIO()
+        transparent_image.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        final_base64 = base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
 
-        logger.info(f"Saved generated image: {output_path}")
+        # data URI形式で返す
+        image_data_uri = f"data:image/png;base64,{final_base64}"
 
-        # フロントエンドから参照できる相対パス
-        relative_path = f"/images/crews/generated/{file_name}"
-        return relative_path
+        logger.info(f"Generated image for {crew_name} (Base64 length: {len(final_base64)})")
+
+        # フォールバック用のデフォルトパスも返す
+        default_path = f"/images/crews/monster_{random.randint(1, 6)}.png"
+        return default_path, image_data_uri
 
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code", "")
@@ -288,7 +290,7 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> str:
         raise
 
 
-async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> str:
+async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> tuple[str, str | None]:
     """
     画像生成を試み、失敗時はデフォルト画像を返す
 
@@ -297,7 +299,9 @@ async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> 
         rarity: レアリティ（1-5）
 
     Returns:
-        str: 画像パス（生成成功時は新しい画像、失敗時はデフォルト）
+        tuple: (image_url, image_base64)
+            - image_url: 画像パス（フォールバック用）
+            - image_base64: 生成された画像のBase64データ（失敗時はNone）
     """
     try:
         return await generate_crew_image(crew_name, rarity)
@@ -312,7 +316,7 @@ async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> 
             "/images/crews/monster_5.png",
             "/images/crews/monster_6.png",
         ]
-        return random.choice(default_images)
+        return random.choice(default_images), None
 
 
 # 進化用プロンプト（Stability AI SD3.5 Large用）
