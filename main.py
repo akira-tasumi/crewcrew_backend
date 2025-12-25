@@ -521,7 +521,8 @@ async def create_crew(
         role=new_crew.role,
         level=new_crew.level,
         exp=new_crew.exp,
-        image=new_crew.image_url,
+        # Base64がある場合はそれを優先
+        image=new_crew.image_base64 if new_crew.image_base64 else new_crew.image_url,
         personality=new_crew.personality,
         greeting=greeting,
         rarity=new_crew.rarity,

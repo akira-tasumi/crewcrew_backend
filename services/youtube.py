@@ -66,48 +66,44 @@ def get_video_transcript(video_id: str) -> str | None:
     try:
         print(f"[YouTube] Fetching transcript for video_id: {video_id}")
 
-        api = YouTubeTranscriptApi()
+        # 日本語優先、次に英語、それ以外は自動
+        languages_to_try = ['ja', 'en']
 
-        # 利用可能な字幕リストを取得
-        transcript_list = api.list(video_id)
-        print(f"[YouTube] Available transcripts: {[t.language_code for t in transcript_list]}")
+        transcript_data = None
+        used_language = None
 
-        target_transcript = None
-
-        # 優先順位1: 日本語字幕を探す
-        for t in transcript_list:
-            if t.language_code == 'ja':
-                target_transcript = t
-                print(f"[YouTube] Found Japanese transcript")
+        for lang in languages_to_try:
+            try:
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
+                used_language = lang
+                print(f"[YouTube] Found {lang} transcript")
                 break
+            except Exception:
+                continue
 
-        # 優先順位2: 英語字幕を探す
-        if not target_transcript:
-            for t in transcript_list:
-                if t.language_code == 'en':
-                    target_transcript = t
-                    print(f"[YouTube] Found English transcript")
-                    break
+        # 指定言語で見つからない場合は、利用可能な字幕を取得
+        if not transcript_data:
+            try:
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+                used_language = "auto"
+                print(f"[YouTube] Using auto-detected transcript")
+            except Exception as e:
+                print(f"[YouTube] Could not fetch any transcript: {e}")
+                return None
 
-        # 優先順位3: 利用可能な最初の字幕
-        if not target_transcript and transcript_list:
-            target_transcript = transcript_list[0]
-            print(f"[YouTube] Using first available transcript: {target_transcript.language_code}")
-
-        if not target_transcript:
+        if not transcript_data:
             print(f"[YouTube] No transcript available for video_id: {video_id}")
             return None
 
-        # 字幕データを取得・連結
-        fetched_data = target_transcript.fetch()
-        full_text = " ".join([snippet.text for snippet in fetched_data])
+        # 字幕データを連結
+        full_text = " ".join([snippet['text'] for snippet in transcript_data])
 
         # トークン制限対策: 長すぎる場合は先頭5000文字でカット
         if len(full_text) > 5000:
             print(f"[YouTube] Transcript truncated from {len(full_text)} to 5000 chars")
             full_text = full_text[:5000]
 
-        print(f"[YouTube] Successfully fetched transcript ({len(full_text)} chars)")
+        print(f"[YouTube] Successfully fetched transcript ({len(full_text)} chars, lang: {used_language})")
         return full_text
 
     except TranscriptsDisabled:
