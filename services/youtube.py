@@ -85,7 +85,8 @@ def get_video_transcript(video_id: str) -> str | None:
                     used_language = "auto"
                 print(f"[YouTube] Found {used_language} transcript")
                 break
-            except Exception:
+            except Exception as e:
+                print(f"[YouTube] Failed to fetch with lang={lang}: {type(e).__name__}: {e}")
                 continue
 
         if not transcript_data:
