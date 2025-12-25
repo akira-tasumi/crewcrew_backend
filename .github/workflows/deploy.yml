@@ -39,7 +39,7 @@ jobs:
       - name: Deploy to App Runner
         run: |
           # App RunnerサービスのARNを取得
-          SERVICE_ARN=$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='crewcrew-backend'].ServiceArn" --output text)
+          SERVICE_ARN=$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='crewcrew-api'].ServiceArn" --output text)
 
           if [ -n "$SERVICE_ARN" ]; then
             echo "Triggering deployment for App Runner service..."
