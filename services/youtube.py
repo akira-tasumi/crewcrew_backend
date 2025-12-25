@@ -48,6 +48,37 @@ def extract_video_id(url: str) -> str | None:
     return None
 
 
+def _fetch_with_new_api(video_id: str, languages: list[str] | None) -> list[dict] | None:
+    """新しいAPI (インスタンスメソッド) を試す"""
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        if languages:
+            result = ytt_api.fetch(video_id, languages=languages)
+        else:
+            result = ytt_api.fetch(video_id)
+        # FetchedTranscriptをリストに変換
+        return [{'text': item.text} for item in result]
+    except AttributeError:
+        # 新しいAPIがない場合
+        return None
+    except Exception as e:
+        raise e
+
+
+def _fetch_with_old_api(video_id: str, languages: list[str] | None) -> list[dict] | None:
+    """旧API (クラスメソッド) を試す"""
+    try:
+        if languages:
+            return YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+        else:
+            return YouTubeTranscriptApi.get_transcript(video_id)
+    except AttributeError:
+        # 旧APIがない場合
+        return None
+    except Exception as e:
+        raise e
+
+
 def get_video_transcript(video_id: str) -> str | None:
     """
     動画IDから字幕テキストを取得する
@@ -74,15 +105,16 @@ def get_video_transcript(video_id: str) -> str | None:
 
         for lang in languages_to_try:
             try:
-                if lang:
-                    # 旧API (クラスメソッド) を使用
-                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=lang)
-                    used_language = lang[0]
-                else:
-                    transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-                    used_language = "auto"
-                print(f"[YouTube] Found {used_language} transcript")
-                break
+                # 新しいAPIを試す
+                transcript_data = _fetch_with_new_api(video_id, lang)
+                if transcript_data is None:
+                    # 旧APIを試す
+                    transcript_data = _fetch_with_old_api(video_id, lang)
+
+                if transcript_data:
+                    used_language = lang[0] if lang else "auto"
+                    print(f"[YouTube] Found {used_language} transcript")
+                    break
             except Exception as e:
                 print(f"[YouTube] Failed to fetch with lang={lang}: {type(e).__name__}: {e}")
                 continue
