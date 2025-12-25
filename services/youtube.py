@@ -3,10 +3,11 @@ YouTube字幕取得サービス
 
 YouTubeの動画URLから字幕（Transcript）を取得する機能を提供。
 複数の方法でフォールバック:
-1. YouTube Data API v3 (公式API、最も信頼性が高い)
-2. youtube-transcript-api (新API)
-3. youtube-transcript-api (旧API)
-4. yt-dlp (より堅牢、AWS環境での制限回避)
+1. pytubefix (最も信頼性が高い、AWS環境でも動作)
+2. ページスクレイピング (ytInitialPlayerResponseから取得)
+3. YouTube Data API v3 + timedtext API
+4. youtube-transcript-api
+5. yt-dlp
 """
 
 import re
@@ -17,8 +18,65 @@ import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
+# pytubefix をインポート（なければNone）
+try:
+    from pytubefix import YouTube as PytubeFixYouTube
+    PYTUBEFIX_AVAILABLE = True
+except ImportError:
+    PytubeFixYouTube = None
+    PYTUBEFIX_AVAILABLE = False
+
 # YouTube Data API v3 キー（環境変数から取得、なければデフォルト）
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyC_n8S8GymsPstVbqkkMLWQJXYELLtqBWI")
+
+
+def _fetch_with_pytubefix(video_id: str) -> list[dict] | None:
+    """
+    pytubefixを使って字幕を取得する
+    最も信頼性が高く、AWS環境でも動作する
+    """
+    if not PYTUBEFIX_AVAILABLE:
+        print("[YouTube] pytubefix not available")
+        return None
+
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        yt = PytubeFixYouTube(url)
+
+        # 字幕リストを取得
+        captions = yt.captions
+
+        # 優先順位: 日本語 → 英語 → 自動生成英語 → 最初の字幕
+        caption = None
+        for lang_code in ["ja", "en", "a.en"]:
+            if lang_code in captions:
+                caption = captions[lang_code]
+                break
+
+        # 見つからなければ最初の字幕を使用
+        if caption is None and len(captions) > 0:
+            caption = list(captions)[0]
+
+        if caption is None:
+            print(f"[YouTube] pytubefix: No captions found")
+            return None
+
+        # SRT形式で字幕を取得
+        srt_content = caption.generate_srt_captions()
+
+        # SRTからテキストのみを抽出
+        text = _parse_srt(srt_content)
+
+        if text:
+            lang_name = getattr(caption, 'name', 'unknown')
+            print(f"[YouTube] pytubefix: Found captions ({lang_name})")
+            return [{"text": text}]
+
+        return None
+
+    except Exception as e:
+        print(f"[YouTube] pytubefix error: {type(e).__name__}: {e}")
+        return None
 
 
 def extract_video_id(url: str) -> str | None:
@@ -138,6 +196,11 @@ def _fetch_captions_via_timedtext(video_id: str, lang: str = None) -> list[dict]
     これは非公式だが、APIキーなしでも動作する場合がある
     """
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ja,en;q=0.9",
+        }
+
         # 試す言語のリスト
         langs_to_try = [lang] if lang else []
         langs_to_try.extend(["ja", "en", ""])
@@ -148,11 +211,6 @@ def _fetch_captions_via_timedtext(video_id: str, lang: str = None) -> list[dict]
                 url = f"https://www.youtube.com/api/timedtext?v={video_id}&lang={try_lang}&fmt=json3"
             else:
                 url = f"https://www.youtube.com/api/timedtext?v={video_id}&fmt=json3"
-
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "ja,en;q=0.9",
-            }
 
             response = requests.get(url, headers=headers, timeout=10)
 
@@ -208,6 +266,139 @@ def _fetch_captions_via_timedtext(video_id: str, lang: str = None) -> list[dict]
 
     except Exception as e:
         print(f"[YouTube] timedtext API error: {e}")
+        return None
+
+
+def _fetch_captions_from_page(video_id: str) -> list[dict] | None:
+    """
+    YouTubeのページHTMLから字幕URLを抽出して取得する
+    ページ内のytInitialPlayerResponseから字幕トラック情報を取得
+    """
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ja,en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        }
+
+        response = requests.get(url, headers=headers, timeout=15)
+
+        if response.status_code != 200:
+            print(f"[YouTube] Page fetch failed: {response.status_code}")
+            return None
+
+        html = response.text
+
+        # ytInitialPlayerResponse からJSON部分を抽出
+        pattern = r'ytInitialPlayerResponse\s*=\s*(\{.+?\});'
+        match = re.search(pattern, html)
+
+        if not match:
+            # 別のパターンも試す
+            pattern2 = r'var\s+ytInitialPlayerResponse\s*=\s*(\{.+?\});'
+            match = re.search(pattern2, html)
+
+        if not match:
+            print(f"[YouTube] Could not find ytInitialPlayerResponse in page")
+            return None
+
+        try:
+            player_response = json.loads(match.group(1))
+        except json.JSONDecodeError as e:
+            print(f"[YouTube] Failed to parse player response: {e}")
+            return None
+
+        # 字幕トラック情報を取得
+        captions = player_response.get("captions", {})
+        player_captions = captions.get("playerCaptionsTracklistRenderer", {})
+        caption_tracks = player_captions.get("captionTracks", [])
+
+        if not caption_tracks:
+            print(f"[YouTube] No caption tracks in player response")
+            return None
+
+        # 優先順位: 日本語 → 英語 → 最初のトラック
+        selected_track = None
+        for preferred_lang in ["ja", "en"]:
+            for track in caption_tracks:
+                lang_code = track.get("languageCode", "")
+                if lang_code == preferred_lang:
+                    selected_track = track
+                    break
+            if selected_track:
+                break
+
+        if not selected_track and caption_tracks:
+            selected_track = caption_tracks[0]
+
+        if not selected_track:
+            return None
+
+        # 字幕URLを取得
+        caption_url = selected_track.get("baseUrl", "")
+        lang_code = selected_track.get("languageCode", "unknown")
+
+        if not caption_url:
+            print(f"[YouTube] No caption URL found")
+            return None
+
+        # JSON形式で取得するためにfmt=json3を追加
+        if "fmt=" not in caption_url:
+            caption_url += "&fmt=json3"
+        else:
+            caption_url = re.sub(r'fmt=\w+', 'fmt=json3', caption_url)
+
+        print(f"[YouTube] Found {lang_code} caption track, fetching...")
+
+        # 字幕データを取得
+        caption_response = requests.get(caption_url, headers=headers, timeout=10)
+
+        if caption_response.status_code != 200:
+            print(f"[YouTube] Caption fetch failed: {caption_response.status_code}")
+            return None
+
+        try:
+            caption_data = caption_response.json()
+            events = caption_data.get("events", [])
+
+            if events:
+                texts = []
+                for event in events:
+                    segs = event.get("segs", [])
+                    for seg in segs:
+                        text = seg.get("utf8", "").strip()
+                        if text and text != "\n":
+                            texts.append(text)
+
+                if texts:
+                    print(f"[YouTube] Page scrape: Found {lang_code} captions ({len(texts)} segments)")
+                    return [{"text": " ".join(texts)}]
+        except json.JSONDecodeError:
+            # XMLとして試す
+            try:
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(caption_response.text)
+                texts = []
+                for text_elem in root.findall('.//text'):
+                    text = text_elem.text
+                    if text:
+                        texts.append(text.strip())
+
+                if texts:
+                    print(f"[YouTube] Page scrape: Found {lang_code} captions (XML format)")
+                    return [{"text": " ".join(texts)}]
+            except Exception:
+                pass
+
+        print(f"[YouTube] Page scrape: Could not parse captions")
+        return None
+
+    except requests.RequestException as e:
+        print(f"[YouTube] Page fetch error: {e}")
+        return None
+    except Exception as e:
+        print(f"[YouTube] Page scrape error: {e}")
         return None
 
 
@@ -381,9 +572,11 @@ def get_video_transcript(video_id: str) -> str | None:
     動画IDから字幕テキストを取得する
 
     優先順位:
-    1. YouTube Data API + timedtext API (AWS環境で最も信頼性が高い)
-    2. youtube-transcript-api (日本語 → 英語 → 自動)
-    3. yt-dlp フォールバック
+    1. pytubefix (最も信頼性が高い、AWS環境でも動作)
+    2. ページスクレイピング（ytInitialPlayerResponseから直接URL取得）
+    3. YouTube Data API + timedtext API
+    4. youtube-transcript-api
+    5. yt-dlp フォールバック
 
     Args:
         video_id: YouTube動画ID
@@ -397,18 +590,32 @@ def get_video_transcript(video_id: str) -> str | None:
         transcript_data = None
         used_method = None
 
-        # 1. まずYouTube Data API / timedtext APIを試す（AWS環境で有効）
-        print(f"[YouTube] Trying YouTube Data API / timedtext...")
-        transcript_data = _fetch_with_youtube_data_api(video_id)
+        # 1. まずpytubefixを試す（AWS環境で最も信頼性が高い）
+        print(f"[YouTube] Trying pytubefix...")
+        transcript_data = _fetch_with_pytubefix(video_id)
         if transcript_data:
-            used_method = "YouTube Data API"
-        else:
-            # timedtext APIを直接試す
-            transcript_data = _fetch_captions_via_timedtext(video_id)
-            if transcript_data:
-                used_method = "timedtext API"
+            used_method = "pytubefix"
 
-        # 2. youtube-transcript-api を試す
+        # 2. ページスクレイピングを試す
+        if not transcript_data:
+            print(f"[YouTube] Trying page scraping (ytInitialPlayerResponse)...")
+            transcript_data = _fetch_captions_from_page(video_id)
+            if transcript_data:
+                used_method = "page scraping"
+
+        # 3. YouTube Data API / timedtext APIを試す
+        if not transcript_data:
+            print(f"[YouTube] Trying YouTube Data API / timedtext...")
+            transcript_data = _fetch_with_youtube_data_api(video_id)
+            if transcript_data:
+                used_method = "YouTube Data API"
+            else:
+                # timedtext APIを直接試す
+                transcript_data = _fetch_captions_via_timedtext(video_id)
+                if transcript_data:
+                    used_method = "timedtext API"
+
+        # 4. youtube-transcript-api を試す
         if not transcript_data:
             print(f"[YouTube] Trying youtube-transcript-api...")
             languages_to_try = [['ja'], ['en'], None]
@@ -429,7 +636,7 @@ def get_video_transcript(video_id: str) -> str | None:
                     print(f"[YouTube] transcript-api error with lang={lang}: {type(e).__name__}: {e}")
                     continue
 
-        # 3. yt-dlp フォールバック
+        # 5. yt-dlp フォールバック
         if not transcript_data:
             print(f"[YouTube] Trying yt-dlp fallback...")
             transcript_data = _fetch_with_ytdlp(video_id)

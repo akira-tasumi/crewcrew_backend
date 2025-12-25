@@ -577,19 +577,29 @@ async def delete_crew(
     db: Session = Depends(get_db),
 ) -> dict:
     """
-    クルーを削除する
+    クルーを削除する（関連データも一緒に削除）
 
     - crew_id: 削除するクルーのID
     """
+    from models import TaskLog, CrewGadget, CrewSkill, ProjectTask
+
     crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
     if not crew:
         raise HTTPException(status_code=404, detail="Crew not found")
 
     crew_name = crew.name
+
+    # 関連データを先に削除
+    db.query(TaskLog).filter(TaskLog.crew_id == crew_id).delete()
+    db.query(CrewGadget).filter(CrewGadget.crew_id == crew_id).delete()
+    db.query(CrewSkill).filter(CrewSkill.crew_id == crew_id).delete()
+    db.query(ProjectTask).filter(ProjectTask.crew_id == crew_id).delete()
+
+    # クルーを削除
     db.delete(crew)
     db.commit()
 
-    logger.info(f"Deleted crew: {crew_name} (ID: {crew_id})")
+    logger.info(f"Deleted crew: {crew_name} (ID: {crew_id}) with all related data")
 
     return {"success": True, "message": f"Crew '{crew_name}' deleted successfully"}
 

@@ -37,3 +37,4 @@ onnxruntime==1.17.1
 # YouTube Transcript
 youtube-transcript-api==0.6.3
 yt-dlp==2024.12.23
+pytubefix==10.3.6
