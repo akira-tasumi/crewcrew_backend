@@ -3068,3 +3068,228 @@ async def execute_project(
             success=False,
             error=f"プロジェクトの実行に失敗しました: {str(e)}",
         )
+
+
+@app.post("/api/director/execute-stream")
+async def execute_project_stream(
+    project_title: str = Form(...),
+    description: str = Form(...),
+    user_goal: str = Form(...),
+    required_inputs_json: str = Form(...),
+    tasks_json: str = Form(...),
+    input_values_json: str = Form(...),
+    files: Optional[list[UploadFile]] = File(None),
+    db: Session = Depends(get_db),
+):
+    """
+    プロジェクトを実行し、SSEでタスクごとに進捗を返す
+    """
+    from starlette.responses import StreamingResponse
+    from services.pdf_reader import extract_text_from_pdf
+    from services.web_reader import fetch_web_content
+    import io
+    import asyncio
+
+    async def generate():
+        try:
+            # JSONをパース
+            required_inputs = json.loads(required_inputs_json)
+            tasks = json.loads(tasks_json)
+            input_values = json.loads(input_values_json)
+
+            # ファイルをキーでマッピング
+            file_map: dict[str, UploadFile] = {}
+            if files:
+                for f in files:
+                    if f.filename and ":::" in f.filename:
+                        key = f.filename.split(":::")[0]
+                        file_map[key] = f
+
+            # 1. コンテキスト構築
+            context: dict[str, str] = {}
+
+            for inp in required_inputs:
+                key = inp["key"]
+                input_type = inp["type"]
+                label = inp["label"]
+
+                try:
+                    if input_type == "file":
+                        if key in file_map:
+                            file = file_map[key]
+                            content = await file.read()
+                            text = extract_text_from_pdf(io.BytesIO(content))
+                            context[key] = text
+                        else:
+                            context[key] = f"（{label}のファイルが見つかりませんでした）"
+
+                    elif input_type == "url":
+                        url = input_values.get(key, "")
+                        if url:
+                            from services.sheet_service import is_google_sheets_url, read_public_sheet, format_csv_for_prompt
+                            if is_google_sheets_url(url):
+                                try:
+                                    csv_text = read_public_sheet(url)
+                                    text = format_csv_for_prompt(csv_text)
+                                except ValueError as e:
+                                    text = f"（スプレッドシートの読み込みに失敗しました: {str(e)}）"
+                            else:
+                                text = fetch_web_content(url)
+                            context[key] = text
+                        else:
+                            context[key] = f"（{label}のURLが入力されていません）"
+
+                    elif input_type == "text":
+                        context[key] = input_values.get(key, "")
+
+                except Exception as e:
+                    context[key] = f"（{label}の読み込みに失敗しました: {str(e)}）"
+
+            # 開始イベントを送信
+            total_tasks = len(tasks)
+            yield f"data: {json.dumps({'type': 'start', 'total_tasks': total_tasks})}\n\n"
+            await asyncio.sleep(0)  # イベントループに制御を戻してフラッシュ
+
+            # 2. タスクを順次実行
+            task_results = []
+            previous_output = ""
+
+            bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+            for idx, task in enumerate(tasks):
+                role = task["role"]
+                crew_id = task["assigned_crew_id"]
+                crew_name = task["assigned_crew_name"]
+                crew_image = task["assigned_crew_image"]
+                instruction = task["instruction"]
+
+                # 開始通知を送信
+                yield f"data: {json.dumps({'type': 'task_start', 'task_index': idx, 'crew_name': crew_name, 'role': role})}\n\n"
+                await asyncio.sleep(0)  # イベントループに制御を戻してフラッシュ
+
+                # クルー情報を取得
+                crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+                personality = crew.personality if crew else ""
+
+                # 変数置換
+                processed_instruction = instruction
+                for key, value in context.items():
+                    processed_instruction = processed_instruction.replace(f"{{{key}}}", value)
+
+                # プロンプト構築
+                system_prompt = f"""あなたは「{crew_name}」という名前のクルー（社員）です。
+役割: {role}
+性格: {personality}
+
+あなたはプロジェクトチームの一員として、与えられたタスクを遂行してください。
+前のタスクの成果物がある場合は、それを参考にして作業を進めてください。"""
+
+                user_prompt = f"""## あなたのタスク
+{processed_instruction}
+
+"""
+                if previous_output:
+                    user_prompt += f"""## 前のタスクの成果物
+{previous_output}
+
+"""
+                user_prompt += "上記の指示に従って、タスクを実行してください。"
+
+                try:
+                    body = json.dumps({
+                        "anthropic_version": "bedrock-2023-05-31",
+                        "max_tokens": 4096,
+                        "system": system_prompt,
+                        "messages": [{"role": "user", "content": user_prompt}],
+                        "temperature": 0.7,
+                    })
+
+                    # Bedrockの同期呼び出しを別スレッドで実行（ストリーミングをブロックしないため）
+                    loop = asyncio.get_event_loop()
+                    def call_bedrock():
+                        return bedrock.invoke_model(
+                            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
+                            body=body
+                        )
+                    response = await loop.run_in_executor(None, call_bedrock)
+
+                    response_body = json.loads(response["body"].read())
+                    result_text = response_body["content"][0]["text"]
+
+                    task_result = {
+                        "task_index": idx,
+                        "role": role,
+                        "crew_name": crew_name,
+                        "crew_image": crew_image,
+                        "instruction": instruction,
+                        "result": result_text,
+                        "status": "completed"
+                    }
+                    task_results.append(task_result)
+                    previous_output = result_text
+
+                    # 完了通知を送信
+                    yield f"data: {json.dumps({'type': 'task_complete', 'task_index': idx, 'task_result': task_result})}\n\n"
+                    await asyncio.sleep(0)  # イベントループに制御を戻してフラッシュ
+
+                    logger.info(f"Task {idx + 1} completed: {role} by {crew_name}")
+
+                except Exception as e:
+                    logger.error(f"Error executing task {idx + 1}: {e}")
+                    task_result = {
+                        "task_index": idx,
+                        "role": role,
+                        "crew_name": crew_name,
+                        "crew_image": crew_image,
+                        "instruction": instruction,
+                        "result": f"エラーが発生しました: {str(e)}",
+                        "status": "error"
+                    }
+                    task_results.append(task_result)
+                    previous_output = f"（前のタスクでエラーが発生しました: {str(e)}）"
+
+                    yield f"data: {json.dumps({'type': 'task_complete', 'task_index': idx, 'task_result': task_result})}\n\n"
+                    await asyncio.sleep(0)  # イベントループに制御を戻してフラッシュ
+
+            # Slack通知
+            should_notify_slack = False
+            slack_keywords = ["slack", "Slack", "SLACK", "スラック"]
+            for keyword in slack_keywords:
+                if keyword in user_goal:
+                    should_notify_slack = True
+                    break
+                for task in tasks:
+                    if keyword in task.get("instruction", ""):
+                        should_notify_slack = True
+                        break
+                if should_notify_slack:
+                    break
+
+            if should_notify_slack:
+                try:
+                    from services.slack_notifier import send_project_completion
+                    task_summaries = [
+                        {"crew_name": r["crew_name"], "role": r["role"], "status": r["status"]}
+                        for r in task_results
+                    ]
+                    send_project_completion(project_title, task_summaries)
+                except Exception as slack_error:
+                    logger.warning(f"Failed to send Slack notification: {slack_error}")
+
+            # 完了イベントを送信
+            yield f"data: {json.dumps({'type': 'complete', 'success': True, 'project_title': project_title, 'task_results': task_results})}\n\n"
+
+            logger.info(f"Project execution completed: {project_title}")
+
+        except Exception as e:
+            logger.error(f"Execute project stream error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )

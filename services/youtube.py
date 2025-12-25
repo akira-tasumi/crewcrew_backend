@@ -2,9 +2,16 @@
 YouTube字幕取得サービス
 
 YouTubeの動画URLから字幕（Transcript）を取得する機能を提供。
+複数の方法でフォールバック:
+1. youtube-transcript-api (新API)
+2. youtube-transcript-api (旧API)
+3. yt-dlp (より堅牢、AWS環境での制限回避)
 """
 
 import re
+import subprocess
+import json
+import os
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
@@ -79,14 +86,147 @@ def _fetch_with_old_api(video_id: str, languages: list[str] | None) -> list[dict
         raise e
 
 
+def _fetch_with_ytdlp(video_id: str) -> list[dict] | None:
+    """
+    yt-dlpを使って字幕を取得する（AWS環境でのフォールバック）
+    yt-dlpはより堅牢でプロキシサポートもある
+    """
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+        # yt-dlpで字幕情報を取得
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-auto-sub",
+            "--sub-lang", "ja,en",
+            "--sub-format", "json3",
+            "--print", "%(subtitles)j",
+            "--no-warnings",
+            url
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"[YouTube] yt-dlp failed: {result.stderr}")
+            return None
+
+        # 字幕JSONをパース
+        try:
+            subtitles_info = json.loads(result.stdout) if result.stdout.strip() else {}
+        except json.JSONDecodeError:
+            print(f"[YouTube] yt-dlp: Could not parse subtitles JSON")
+            return None
+
+        if not subtitles_info:
+            # 自動生成字幕を試す
+            cmd_auto = [
+                "yt-dlp",
+                "--skip-download",
+                "--write-auto-sub",
+                "--sub-lang", "ja,en",
+                "--print", "%(automatic_captions)j",
+                "--no-warnings",
+                url
+            ]
+
+            result_auto = subprocess.run(
+                cmd_auto,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result_auto.returncode == 0 and result_auto.stdout.strip():
+                try:
+                    subtitles_info = json.loads(result_auto.stdout)
+                except json.JSONDecodeError:
+                    pass
+
+        if not subtitles_info:
+            print(f"[YouTube] yt-dlp: No subtitles found")
+            return None
+
+        # 字幕を実際にダウンロード
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_template = os.path.join(tmpdir, "%(id)s")
+
+            download_cmd = [
+                "yt-dlp",
+                "--skip-download",
+                "--write-sub",
+                "--write-auto-sub",
+                "--sub-lang", "ja,en",
+                "--sub-format", "vtt",
+                "--convert-subs", "srt",
+                "-o", output_template,
+                "--no-warnings",
+                url
+            ]
+
+            subprocess.run(download_cmd, capture_output=True, timeout=30)
+
+            # ダウンロードされた字幕ファイルを探す
+            for lang in ["ja", "en"]:
+                srt_path = os.path.join(tmpdir, f"{video_id}.{lang}.srt")
+                if os.path.exists(srt_path):
+                    with open(srt_path, "r", encoding="utf-8") as f:
+                        srt_content = f.read()
+                    # SRTからテキストを抽出
+                    text = _parse_srt(srt_content)
+                    if text:
+                        print(f"[YouTube] yt-dlp: Found {lang} subtitles")
+                        return [{"text": text}]
+
+        return None
+
+    except subprocess.TimeoutExpired:
+        print(f"[YouTube] yt-dlp: Timeout")
+        return None
+    except FileNotFoundError:
+        print(f"[YouTube] yt-dlp: Not installed")
+        return None
+    except Exception as e:
+        print(f"[YouTube] yt-dlp error: {e}")
+        return None
+
+
+def _parse_srt(srt_content: str) -> str:
+    """SRTファイルからテキスト部分のみを抽出"""
+    lines = srt_content.split('\n')
+    text_lines = []
+
+    for line in lines:
+        line = line.strip()
+        # 番号行やタイムスタンプ行をスキップ
+        if not line:
+            continue
+        if line.isdigit():
+            continue
+        if '-->' in line:
+            continue
+        # HTMLタグを除去
+        line = re.sub(r'<[^>]+>', '', line)
+        if line:
+            text_lines.append(line)
+
+    return ' '.join(text_lines)
+
+
 def get_video_transcript(video_id: str) -> str | None:
     """
     動画IDから字幕テキストを取得する
 
     優先順位:
-    1. 日本語字幕 (ja)
-    2. 英語字幕 (en)
-    3. 利用可能な最初の字幕
+    1. youtube-transcript-api (日本語 → 英語 → 自動)
+    2. yt-dlp フォールバック (AWS環境での制限回避用)
 
     Args:
         video_id: YouTube動画ID
@@ -102,6 +242,7 @@ def get_video_transcript(video_id: str) -> str | None:
 
         transcript_data = None
         used_language = None
+        api_failed = False
 
         for lang in languages_to_try:
             try:
@@ -113,11 +254,23 @@ def get_video_transcript(video_id: str) -> str | None:
 
                 if transcript_data:
                     used_language = lang[0] if lang else "auto"
-                    print(f"[YouTube] Found {used_language} transcript")
+                    print(f"[YouTube] Found {used_language} transcript via API")
                     break
+            except (TranscriptsDisabled, NoTranscriptFound) as e:
+                print(f"[YouTube] API failed with lang={lang}: {type(e).__name__}")
+                api_failed = True
+                continue
             except Exception as e:
                 print(f"[YouTube] Failed to fetch with lang={lang}: {type(e).__name__}: {e}")
+                api_failed = True
                 continue
+
+        # youtube-transcript-api が失敗した場合、yt-dlp を試す
+        if not transcript_data and api_failed:
+            print(f"[YouTube] Trying yt-dlp fallback...")
+            transcript_data = _fetch_with_ytdlp(video_id)
+            if transcript_data:
+                used_language = "yt-dlp"
 
         if not transcript_data:
             print(f"[YouTube] No transcript available for video_id: {video_id}")
@@ -131,17 +284,41 @@ def get_video_transcript(video_id: str) -> str | None:
             print(f"[YouTube] Transcript truncated from {len(full_text)} to 5000 chars")
             full_text = full_text[:5000]
 
-        print(f"[YouTube] Successfully fetched transcript ({len(full_text)} chars, lang: {used_language})")
+        print(f"[YouTube] Successfully fetched transcript ({len(full_text)} chars, method: {used_language})")
         return full_text
 
     except TranscriptsDisabled:
         print(f"[YouTube] Transcripts are disabled for video_id: {video_id}")
+        # yt-dlp フォールバック
+        print(f"[YouTube] Trying yt-dlp fallback...")
+        transcript_data = _fetch_with_ytdlp(video_id)
+        if transcript_data:
+            full_text = " ".join([snippet['text'] for snippet in transcript_data])
+            if len(full_text) > 5000:
+                full_text = full_text[:5000]
+            return full_text
         return None
     except NoTranscriptFound:
         print(f"[YouTube] No transcript found for video_id: {video_id}")
+        # yt-dlp フォールバック
+        print(f"[YouTube] Trying yt-dlp fallback...")
+        transcript_data = _fetch_with_ytdlp(video_id)
+        if transcript_data:
+            full_text = " ".join([snippet['text'] for snippet in transcript_data])
+            if len(full_text) > 5000:
+                full_text = full_text[:5000]
+            return full_text
         return None
     except Exception as e:
         print(f"[YouTube] Transcript Error: {e}")
+        # yt-dlp フォールバック
+        print(f"[YouTube] Trying yt-dlp fallback...")
+        transcript_data = _fetch_with_ytdlp(video_id)
+        if transcript_data:
+            full_text = " ".join([snippet['text'] for snippet in transcript_data])
+            if len(full_text) > 5000:
+                full_text = full_text[:5000]
+            return full_text
         return None
 
 
