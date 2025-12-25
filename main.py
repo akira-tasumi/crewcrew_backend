@@ -45,6 +45,19 @@ async def lifespan(app: FastAPI):
     logger.info("Creating database tables...")
     Base.metadata.create_all(bind=engine)
 
+    # マイグレーション: image_base64カラムを追加（存在しない場合）
+    logger.info("Running migrations...")
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE crews ADD COLUMN image_base64 TEXT"))
+            conn.commit()
+            logger.info("Added image_base64 column to crews table")
+        except Exception as e:
+            # カラムが既に存在する場合はエラーを無視
+            if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+                logger.info(f"Migration note: {e}")
+
     logger.info("Seeding initial data...")
     db = SessionLocal()
     try:
