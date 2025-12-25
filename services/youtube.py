@@ -3,11 +3,13 @@ YouTube字幕取得サービス
 
 YouTubeの動画URLから字幕（Transcript）を取得する機能を提供。
 複数の方法でフォールバック:
-1. pytubefix (最も信頼性が高い、AWS環境でも動作)
-2. ページスクレイピング (ytInitialPlayerResponseから取得)
-3. YouTube Data API v3 + timedtext API
-4. youtube-transcript-api
-5. yt-dlp
+1. 外部API (Supadata - AWS環境でも動作)
+2. pytubefix
+3. InnerTube API
+4. ページスクレイピング (ytInitialPlayerResponseから取得)
+5. YouTube Data API v3 + timedtext API
+6. youtube-transcript-api
+7. yt-dlp
 """
 
 import re
@@ -28,6 +30,133 @@ except ImportError:
 
 # YouTube Data API v3 キー（環境変数から取得、なければデフォルト）
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyC_n8S8GymsPstVbqkkMLWQJXYELLtqBWI")
+
+# Supadata API キー（環境変数から取得、デフォルト値あり）
+SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "sd_8b1d6ebe378d6ecdee2f1e1c2289680d")
+
+# RapidAPI キー（環境変数から取得、デフォルト値あり）
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "d505781432mshb63afcf99a713ecp169106jsna86ca3d39a84")
+
+
+def _fetch_with_supadata(video_id: str) -> list[dict] | None:
+    """
+    Supadata APIを使って字幕を取得
+    https://supadata.ai - 無料枠あり、AWS環境でも動作
+    """
+    if not SUPADATA_API_KEY:
+        print("[YouTube] Supadata: No API key configured")
+        return None
+
+    try:
+        url = "https://api.supadata.ai/v1/youtube/transcript"
+        headers = {
+            "x-api-key": SUPADATA_API_KEY,
+            "Content-Type": "application/json"
+        }
+        params = {
+            "videoId": video_id,
+            "lang": "ja"  # 日本語優先
+        }
+
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+
+        if response.status_code == 200:
+            data = response.json()
+            # Supadataのレスポンス形式に応じて処理
+            if "content" in data:
+                # 文字列の場合
+                if isinstance(data["content"], str):
+                    print(f"[YouTube] Supadata: Success (ja)")
+                    return [{"text": data["content"]}]
+                # リストの場合
+                elif isinstance(data["content"], list):
+                    texts = [item.get("text", "") for item in data["content"] if item.get("text")]
+                    if texts:
+                        print(f"[YouTube] Supadata: Success ({len(texts)} segments)")
+                        return [{"text": " ".join(texts)}]
+
+            # 日本語がない場合は英語を試す
+            params["lang"] = "en"
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if "content" in data:
+                    if isinstance(data["content"], str):
+                        print(f"[YouTube] Supadata: Success (en)")
+                        return [{"text": data["content"]}]
+                    elif isinstance(data["content"], list):
+                        texts = [item.get("text", "") for item in data["content"] if item.get("text")]
+                        if texts:
+                            print(f"[YouTube] Supadata: Success (en, {len(texts)} segments)")
+                            return [{"text": " ".join(texts)}]
+
+        print(f"[YouTube] Supadata: Failed ({response.status_code})")
+        return None
+
+    except Exception as e:
+        print(f"[YouTube] Supadata error: {e}")
+        return None
+
+
+def _fetch_with_rapidapi(video_id: str) -> list[dict] | None:
+    """
+    RapidAPI経由でYouTube字幕を取得
+    youtube-transcriptor APIを使用
+    """
+    if not RAPIDAPI_KEY:
+        print("[YouTube] RapidAPI: No API key configured")
+        return None
+
+    try:
+        # YouTube Transcript API (RapidAPI)
+        url = "https://youtube-transcriptor.p.rapidapi.com/transcript"
+        headers = {
+            "X-RapidAPI-Key": RAPIDAPI_KEY,
+            "X-RapidAPI-Host": "youtube-transcriptor.p.rapidapi.com"
+        }
+
+        # 日本語と英語を試す
+        for lang in ["ja", "en"]:
+            params = {
+                "video_id": video_id,
+                "lang": lang
+            }
+
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+
+            if response.status_code == 200:
+                data = response.json()
+                # レスポンス形式: [{"title": "...", "transcriptionAsText": "...", "transcription": [...]}]
+                if isinstance(data, list) and len(data) > 0:
+                    item = data[0]
+
+                    # transcriptionAsText を優先（テキスト全文）
+                    if isinstance(item, dict) and "transcriptionAsText" in item:
+                        text = item["transcriptionAsText"]
+                        if text and isinstance(text, str) and len(text) > 10:
+                            print(f"[YouTube] RapidAPI: Success ({lang}, {len(text)} chars)")
+                            return [{"text": text}]
+
+                    # transcription 配列からも試す
+                    if isinstance(item, dict) and "transcription" in item:
+                        transcription = item["transcription"]
+                        if isinstance(transcription, list):
+                            texts = []
+                            for seg in transcription:
+                                if isinstance(seg, dict) and "subtitle" in seg:
+                                    texts.append(seg["subtitle"])
+                                elif isinstance(seg, str):
+                                    texts.append(seg)
+                            if texts:
+                                print(f"[YouTube] RapidAPI: Success ({lang}, {len(texts)} segments)")
+                                return [{"text": " ".join(texts)}]
+
+        print(f"[YouTube] RapidAPI: No transcript found")
+        return None
+
+    except Exception as e:
+        print(f"[YouTube] RapidAPI error: {e}")
+        return None
 
 
 def _fetch_with_pytubefix(video_id: str) -> list[dict] | None:
@@ -827,12 +956,14 @@ def get_video_transcript(video_id: str) -> str | None:
     動画IDから字幕テキストを取得する
 
     優先順位:
-    1. pytubefix (最も信頼性が高い)
-    2. InnerTube API (Android clientでAWS環境でも動作する可能性)
-    3. ページスクレイピング（ytInitialPlayerResponseから直接URL取得）
-    4. YouTube Data API + timedtext API
-    5. youtube-transcript-api
-    6. yt-dlp フォールバック
+    1. Supadata API (外部API - AWS環境でも動作)
+    2. RapidAPI (外部API - AWS環境でも動作)
+    3. pytubefix
+    4. InnerTube API (Android clientでAWS環境でも動作する可能性)
+    5. ページスクレイピング（ytInitialPlayerResponseから直接URL取得）
+    6. YouTube Data API + timedtext API
+    7. youtube-transcript-api
+    8. yt-dlp フォールバック
 
     Args:
         video_id: YouTube動画ID
@@ -846,27 +977,41 @@ def get_video_transcript(video_id: str) -> str | None:
         transcript_data = None
         used_method = None
 
-        # 1. まずpytubefixを試す
-        print(f"[YouTube] Trying pytubefix...")
-        transcript_data = _fetch_with_pytubefix(video_id)
+        # 1. まず外部API（Supadata）を試す - AWS環境でも確実に動作
+        print(f"[YouTube] Trying Supadata API...")
+        transcript_data = _fetch_with_supadata(video_id)
         if transcript_data:
-            used_method = "pytubefix"
+            used_method = "Supadata API"
 
-        # 2. InnerTube APIを試す（AWS環境でも動作する可能性が高い）
+        # 2. RapidAPIを試す - AWS環境でも確実に動作
+        if not transcript_data:
+            print(f"[YouTube] Trying RapidAPI...")
+            transcript_data = _fetch_with_rapidapi(video_id)
+            if transcript_data:
+                used_method = "RapidAPI"
+
+        # 3. pytubefixを試す
+        if not transcript_data:
+            print(f"[YouTube] Trying pytubefix...")
+            transcript_data = _fetch_with_pytubefix(video_id)
+            if transcript_data:
+                used_method = "pytubefix"
+
+        # 4. InnerTube APIを試す（AWS環境でも動作する可能性が高い）
         if not transcript_data:
             print(f"[YouTube] Trying InnerTube API (Android client)...")
             transcript_data = _fetch_with_innertube(video_id)
             if transcript_data:
                 used_method = "InnerTube API"
 
-        # 3. ページスクレイピングを試す
+        # 5. ページスクレイピングを試す
         if not transcript_data:
             print(f"[YouTube] Trying page scraping (ytInitialPlayerResponse)...")
             transcript_data = _fetch_captions_from_page(video_id)
             if transcript_data:
                 used_method = "page scraping"
 
-        # 4. YouTube Data API / timedtext APIを試す
+        # 6. YouTube Data API / timedtext APIを試す
         if not transcript_data:
             print(f"[YouTube] Trying YouTube Data API / timedtext...")
             transcript_data = _fetch_with_youtube_data_api(video_id)
@@ -878,7 +1023,7 @@ def get_video_transcript(video_id: str) -> str | None:
                 if transcript_data:
                     used_method = "timedtext API"
 
-        # 5. youtube-transcript-api を試す
+        # 7. youtube-transcript-api を試す
         if not transcript_data:
             print(f"[YouTube] Trying youtube-transcript-api...")
             languages_to_try = [['ja'], ['en'], None]
@@ -899,7 +1044,7 @@ def get_video_transcript(video_id: str) -> str | None:
                     print(f"[YouTube] transcript-api error with lang={lang}: {type(e).__name__}: {e}")
                     continue
 
-        # 6. yt-dlp フォールバック
+        # 8. yt-dlp フォールバック
         if not transcript_data:
             print(f"[YouTube] Trying yt-dlp fallback...")
             transcript_data = _fetch_with_ytdlp(video_id)
