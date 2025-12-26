@@ -1,6 +1,39 @@
+import hashlib
 from sqlalchemy.orm import Session
 
-from models import Crew, Gadget, Skill
+from models import Crew, Gadget, Skill, PersonalityItem, User
+
+
+# ============================================================
+# 認証用ユーザーデータ（test/demo）
+# ============================================================
+def hash_password(password: str) -> str:
+    """パスワードをSHA-256でハッシュ化"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+INITIAL_USERS = [
+    {
+        "username": "test",
+        "hashed_password": hash_password("test"),
+        "is_demo": False,
+        "company_name": "テスト株式会社",
+        "user_name": "テストユーザー",
+        "job_title": "エンジニア",
+        "coin": 3000,
+        "ruby": 50,
+    },
+    {
+        "username": "demo",
+        "hashed_password": hash_password("demo"),
+        "is_demo": True,
+        "company_name": "デモ株式会社",
+        "user_name": "デモユーザー",
+        "job_title": "マネージャー",
+        "coin": 3000,
+        "ruby": 50,
+    },
+]
 
 # ============================================================
 # Roles (役割) - stats配分の定義
@@ -293,6 +326,77 @@ INITIAL_GADGETS = [
 
 
 # ============================================================
+# 特殊性格アイテム（ショップ販売用）- ルビーで購入
+# ============================================================
+SPECIAL_PERSONALITIES = [
+    {
+        "personality_key": "Narcissist",
+        "name": "ナルシスト",
+        "description": "自分に絶対の自信を持つ。「私ほど優秀な人間はいない」が口癖。",
+        "emoji": "✨",
+        "tone": "ナルシストで自信過剰。自分を褒め、華麗な表現を好む。「この私が」「完璧な」を多用。",
+        "ruby_price": 5,
+    },
+    {
+        "personality_key": "King",
+        "name": "王様",
+        "description": "全てを統べる王の風格。「余は〜」「〜であるぞ」と威厳ある話し方。",
+        "emoji": "👑",
+        "tone": "王様口調で威厳がある。「余は」「〜であるぞ」「褒めてつかわす」を使う。",
+        "ruby_price": 8,
+    },
+    {
+        "personality_key": "Tsundere",
+        "name": "ツンデレ",
+        "description": "普段はツンツン、でも時々デレる。「べ、別にあんたのためじゃないんだからね！」",
+        "emoji": "💢",
+        "tone": "ツンデレ。最初は素っ気ないが、褒められると照れる。「べ、別に」「勘違いしないでよね」を使う。",
+        "ruby_price": 5,
+    },
+    {
+        "personality_key": "Chuunibyou",
+        "name": "中二病",
+        "description": "闇の力に目覚めた者。「我が右腕よ、静まれ...」と厨二ワードを連発。",
+        "emoji": "🔮",
+        "tone": "中二病で厨二ワードを多用。「闘の力が」「我が眼」「封印されし」「覚醒」などを使う。",
+        "ruby_price": 5,
+    },
+    {
+        "personality_key": "Ojousama",
+        "name": "お嬢様",
+        "description": "良家のお嬢様。「〜ですわ」「おほほほ」と上品に話す。",
+        "emoji": "🌹",
+        "tone": "お嬢様言葉で上品。「〜ですわ」「〜ましてよ」「おほほ」を使う。庶民的なものに興味を示す。",
+        "ruby_price": 5,
+    },
+    {
+        "personality_key": "Robot",
+        "name": "ロボット",
+        "description": "感情を持たない機械。「了解シマシタ」と無機質に話す。",
+        "emoji": "🤖",
+        "tone": "ロボット口調で無機質。カタカナ交じりで話す。「了解シマシタ」「処理ヲ開始シマス」を使う。",
+        "ruby_price": 3,
+    },
+    {
+        "personality_key": "Yankee",
+        "name": "ヤンキー",
+        "description": "昭和の不良。「あぁ？」「舐めてんじゃねーぞ」と威圧的だが根は優しい。",
+        "emoji": "💪",
+        "tone": "ヤンキー口調で威圧的だが義理人情に厚い。「あぁ？」「〜じゃねーか」を使うが、仕事は真面目にやる。",
+        "ruby_price": 5,
+    },
+    {
+        "personality_key": "Grandpa",
+        "name": "おじいちゃん",
+        "description": "人生経験豊富なおじいちゃん。「わしの若い頃は〜」と昔話をする。",
+        "emoji": "👴",
+        "tone": "おじいちゃん口調で穏やか。「わしは」「〜じゃな」「若いもんは」を使い、昔話を交える。",
+        "ruby_price": 3,
+    },
+]
+
+
+# ============================================================
 # Seed関数
 # ============================================================
 def seed_skills(db: Session) -> None:
@@ -337,8 +441,37 @@ def seed_gadgets(db: Session) -> None:
     print(f"✓ {len(INITIAL_GADGETS)} gadgets seeded")
 
 
+def seed_personality_items(db: Session) -> None:
+    """特殊性格アイテムのマスタデータを投入"""
+    existing_count = db.query(PersonalityItem).count()
+    if existing_count > 0:
+        return
+
+    for item_data in SPECIAL_PERSONALITIES:
+        item = PersonalityItem(**item_data)
+        db.add(item)
+
+    db.commit()
+    print(f"✓ {len(SPECIAL_PERSONALITIES)} personality items seeded")
+
+
+def seed_users(db: Session) -> None:
+    """認証用ユーザー（test/demo）を投入"""
+    for user_data in INITIAL_USERS:
+        existing = db.query(User).filter(User.username == user_data["username"]).first()
+        if existing:
+            continue
+        user = User(**user_data)
+        db.add(user)
+
+    db.commit()
+    print(f"✓ {len(INITIAL_USERS)} auth users seeded")
+
+
 def seed_all(db: Session) -> None:
     """全ての初期データを投入"""
+    seed_users(db)
     seed_skills(db)
     seed_crews(db)
     seed_gadgets(db)
+    seed_personality_items(db)

@@ -281,6 +281,137 @@ async def execute_task_with_crew(
     }
 
 
+async def execute_task_with_crew_and_images(
+    crew_name: str,
+    personality: str,
+    task: str,
+    images: list[dict],
+) -> dict:
+    """
+    クルーの性格を反映してタスクを実行（画像付き版）
+
+    Args:
+        crew_name: クルーの名前
+        personality: クルーの性格設定
+        task: ユーザーからの依頼内容
+        images: 画像データのリスト [{"filename": str, "base64": str, "media_type": str}, ...]
+
+    Returns:
+        dict: {
+            "success": bool,
+            "result": str,
+            "error": str | None
+        }
+    """
+    client = get_bedrock_client()
+
+    # 既存クルーはCREW_PROMPTSを優先、新規クルーはpersonalityを使用
+    if crew_name in CREW_PROMPTS:
+        system_prompt = CREW_PROMPTS[crew_name]
+    else:
+        system_prompt = f"""あなたは「{crew_name}」という名前のAIアシスタントです。
+
+【キャラクター設定】
+- 性格・口調: {personality}
+
+【回答フォーマット】
+- Markdown形式で記述する
+- 重要なポイントは箇条書きにする
+- キャラクターの性格・口調を必ず守る
+- 画像が添付されている場合は、画像の内容を分析して回答に反映する
+- 最後に必ずキャラクターらしい「締めの一言」で会話を終える"""
+
+    # マルチモーダルメッセージを構築
+    content = []
+
+    # 画像を追加
+    for img in images:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img["media_type"],
+                "data": img["base64"],
+            }
+        })
+
+    # テキストを追加
+    content.append({
+        "type": "text",
+        "text": task,
+    })
+
+    # Claude 3.5 Sonnet へのリクエストボディ（マルチモーダル）
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "system": system_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        "temperature": 0.7,
+    }
+
+    # リトライループ（指数バックオフ）
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(f"Sending multimodal request to Bedrock: crew={crew_name}, images={len(images)}, task={task[:50]}... (attempt {attempt + 1}/{MAX_RETRIES})")
+
+            response = client.invoke_model(
+                modelId=MODEL_ID,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(request_body),
+            )
+
+            response_body = json.loads(response["body"].read())
+            result_text = response_body["content"][0]["text"]
+
+            logger.info(f"Received multimodal response from Bedrock: {len(result_text)} characters")
+
+            return {
+                "success": True,
+                "result": result_text,
+                "error": None,
+            }
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            last_error = e
+
+            if error_code == "ThrottlingException":
+                wait_time = INITIAL_BACKOFF * (2 ** attempt)
+                logger.warning(f"Rate limited. Waiting {wait_time}s before retry... (attempt {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Bedrock API error: {e}")
+                return {
+                    "success": False,
+                    "result": None,
+                    "error": str(e),
+                }
+
+        except Exception as e:
+            logger.error(f"Bedrock API error: {e}")
+            return {
+                "success": False,
+                "result": None,
+                "error": str(e),
+            }
+
+    logger.error(f"All retries failed. Last error: {last_error}")
+    return {
+        "success": False,
+        "result": None,
+        "error": "リクエストが混雑しています。しばらく待ってから再度お試しください。",
+    }
+
+
 async def route_task_with_partner(
     partner_name: str,
     partner_personality: str,

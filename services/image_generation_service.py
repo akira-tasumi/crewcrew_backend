@@ -39,43 +39,108 @@ ASSETS_DIR = BASE_DIR / "assets" / "base_monsters"
 # フロントエンドの public/images/crews に保存
 OUTPUT_DIR = BASE_DIR.parent / "frontend" / "public" / "images" / "crews" / "generated"
 
-# ランダムな色変更プロンプト
+
+# ============================================================
+# 改良版プロンプト構成 - モンスター×動物ミックス
+# ============================================================
+
+# ベーススタイル（元のモンスタースタイルを復活）
+BASE_STYLE = "A cute 3D rendered toy figure of a fantasy monster creature, smooth matte plastic texture, rounded friendly form, solid chunky body"
+
+# 役割（Role）→ 見た目・姿勢
+ROLE_VISUAL_MAPPING = {
+    "Sales": "confident stance, bright energetic eyes",
+    "Marketer": "creative pose, inspired expression",
+    "Engineer": "tilted head, focused gaze",
+    "Designer": "elegant stance, artistic gaze",
+    "Admin": "reliable stance, attentive expression",
+    "Manager": "confident posture, commanding presence",
+}
+
+# 性格（Personality）→ 表情・雰囲気
+PERSONALITY_VISUAL_MAPPING = {
+    "Hot-blooded": "fiery expression, bold pose",
+    "Cool": "calm expression, serene demeanor",
+    "Gentle": "soft smile, kind eyes",
+    "Serious": "determined look, sharp eyes",
+    "Playful": "bright smile, mischievous eyes",
+    "Cautious": "careful expression, thoughtful gaze",
+}
+
+# モンスター種族（架空の生物 - 動物名を避ける）
+CREATURE_TYPES = [
+    "blob monster with tiny horns",
+    "round slime creature with antenna",
+    "fluffy spirit with small wings",
+    "pudgy imp with pointed ears",
+    "chubby goblin with big nose",
+    "round ghost with stubby arms",
+    "squishy elemental with glowing marks",
+    "chunky golem with crystal eyes",
+]
+
+# 体型バリエーション
+BODY_VARIATIONS = [
+    "round chubby body",
+    "oval shaped body",
+    "pear shaped body",
+    "blob shaped body",
+]
+
+# 特徴バリエーション（モンスターらしい奇抜さ）
+FEATURE_VARIATIONS = [
+    "single eye, tiny horns",
+    "three eyes, fin on head",
+    "big floppy ears, no nose",
+    "multiple small horns, wide mouth",
+    "antenna on head, stubby tail",
+    "crystal growth on back, glowing eyes",
+    "floating orbs around, spiral marks",
+    "wing-like fins, spotted pattern",
+]
+
+# カラーバリエーション
 COLOR_VARIATIONS = [
-    "blue color scheme",
-    "red color scheme",
-    "green color scheme",
-    "purple color scheme",
-    "golden color scheme",
-    "silver metallic color",
-    "pink and white colors",
-    "dark shadow colors",
-    "rainbow gradient colors",
-    "ice blue frozen colors",
-    "fire orange and red colors",
-    "forest green nature colors",
+    "teal and orange gradient",
+    "blue and gold accent",
+    "purple and silver tones",
+    "coral and cream colors",
+    "mint and pink blend",
+    "navy and gold highlights",
+    "grey and orange accent",
+    "lavender and white tones",
 ]
 
-# ランダムなアクセサリー・装飾プロンプト
+# 装飾品バリエーション（必ず1つ付ける - 頭周りのみで空洞を避ける）
 ACCESSORY_VARIATIONS = [
-    "wearing a tiny crown",
-    "with sparkles and stars around",
-    "wearing a wizard hat",
-    "with angel wings",
-    "wearing sunglasses",
-    "with a magical aura glow",
-    "wearing a bow tie",
-    "with lightning effects",
-    "wearing a flower crown",
-    "with crystal decorations",
-    "wearing a cape",
-    "with flame effects",
+    "wearing small round glasses",
+    "wearing a tiny crown on head",
+    "wearing a cute headband",
+    "wearing a small bow tie",
+    "wearing a tiny scarf",
+    "wearing a mini cape",
+    "holding a small wand",
+    "wearing a tiny hat",
 ]
 
-# 3Dトイフィギュア風スタイル（ブロスタ/あつ森風）
-BASE_STYLE = "A cute 3D rendered toy figure of a monster, smooth plastic texture, soft lighting, rounded edges, isometric view"
+# レアリティ別強化
+RARITY_ENHANCEMENTS = {
+    1: ["simple matte finish"],
+    2: ["subtle glow", "polished finish"],
+    3: ["soft ambient glow", "premium finish"],
+    4: ["golden accent glow", "luxury finish"],
+    5: ["ethereal glow", "light particles", "legendary aura"],
+}
 
-# ネガティブプロンプト（水彩画風を排除）
-NEGATIVE_PROMPT = "watercolor, painting, 2D, flat, brush strokes, sketchy, hand-drawn, illustration, anime, cartoon"
+# 固定キーワード
+FIXED_KEYWORDS = [
+    "high quality 3D render",
+    "soft studio lighting",
+    "clean white background",
+]
+
+# ネガティブプロンプト（リアル動物と空洞を防止）
+NEGATIVE_PROMPT = "realistic animal, real cat, real dog, real fox, hollow body, empty torso, holes, transparent, watercolor, painting, 2D, flat, sketchy, anime, NFT style, scary, horror, realistic human, low quality, blurry"
 
 
 def get_bedrock_client(region: str = AWS_REGION_NOVA):
@@ -105,46 +170,60 @@ def get_random_base_image() -> Path:
     return random.choice(images)
 
 
-# レアリティ別の豪華キーワード（3Dフィギュア風に対応）
-RARITY_ENHANCEMENTS = {
-    1: [],  # ★1: 通常
-    2: ["subtle glossy finish", "slight metallic sheen"],  # ★2: 少し光沢
-    3: ["glowing LED eyes", "shiny metallic accents", "premium plastic finish"],  # ★3: プレミアム感
-    4: ["golden chrome parts", "luxury collectible figure", "holographic shimmer effect"],  # ★4: コレクタブル
-    5: ["diamond encrusted details", "golden throne base", "divine light rays", "legendary ultra rare collectible"],  # ★5: 伝説級
-}
-
-
-def generate_variation_prompt(rarity: int = 1) -> tuple[str, str]:
+def generate_variation_prompt(
+    role: str = "Engineer",
+    personality: str = "Serious",
+    rarity: int = 1
+) -> tuple[str, str]:
     """
-    ランダムなバリエーションプロンプトを生成（3Dトイフィギュア風）
+    モンスター×動物ミックスのプロンプトを生成
 
     Args:
-        rarity: レアリティ（1-5）。高いほど豪華なキーワードを追加
+        role: クルーの役割 (Sales, Marketer, Engineer, Designer, Admin, Manager)
+        personality: クルーの性格 (Hot-blooded, Cool, Gentle, Serious, Playful, Cautious)
+        rarity: レアリティ（1-5）
 
     Returns:
         tuple: (positive_prompt, negative_prompt)
     """
-    color = random.choice(COLOR_VARIATIONS)
+    # 役割に応じた見た目
+    role_visual = ROLE_VISUAL_MAPPING.get(role, ROLE_VISUAL_MAPPING["Engineer"])
+
+    # 性格に応じた表情
+    personality_visual = PERSONALITY_VISUAL_MAPPING.get(personality, PERSONALITY_VISUAL_MAPPING["Serious"])
+
+    # モンスター種族（架空の生物）
+    creature = random.choice(CREATURE_TYPES)
+
+    # 体型
+    body = random.choice(BODY_VARIATIONS)
+
+    # 奇抜な特徴
+    feature = random.choice(FEATURE_VARIATIONS)
+
+    # 装飾品（必ず1つ付ける）
     accessory = random.choice(ACCESSORY_VARIATIONS)
 
-    # レアリティに応じた豪華キーワードを追加
-    rarity_keywords = RARITY_ENHANCEMENTS.get(rarity, [])
-    rarity_text = ", ".join(rarity_keywords) if rarity_keywords else ""
+    # カラー
+    color = random.choice(COLOR_VARIATIONS)
 
-    # 3Dトイフィギュア風のベーススタイルを使用
+    # レアリティ
+    rarity_keywords = RARITY_ENHANCEMENTS.get(rarity, RARITY_ENHANCEMENTS[1])
+    rarity_text = ", ".join(rarity_keywords)
+
+    # プロンプト組み立て
     prompt_parts = [
         BASE_STYLE,
+        creature,
+        body,
+        feature,
+        accessory,  # 装飾品を追加
+        role_visual,
+        personality_visual,
         color,
-        accessory,
-        "high quality render",
-        "studio lighting",
-        "clean white background",
-        "collectible toy aesthetic",
+        rarity_text,
+        *FIXED_KEYWORDS,
     ]
-
-    if rarity_text:
-        prompt_parts.append(rarity_text)
 
     positive_prompt = ", ".join(prompt_parts)
 
@@ -191,7 +270,12 @@ def remove_background(image: Image.Image) -> Image.Image:
     return Image.open(io.BytesIO(output_bytes))
 
 
-async def generate_crew_image(crew_name: str, rarity: int = 1) -> tuple[str, str | None]:
+async def generate_crew_image(
+    crew_name: str,
+    role: str = "Engineer",
+    personality: str = "Serious",
+    rarity: int = 1
+) -> tuple[str, str | None]:
     """
     クルー用の画像を生成する
 
@@ -202,6 +286,8 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> tuple[str, str
 
     Args:
         crew_name: クルーの名前（ログ用）
+        role: クルーの役割 (Sales, Marketer, Engineer, Designer, Admin, Manager)
+        personality: クルーの性格 (Hot-blooded, Cool, Gentle, Serious, Playful, Cautious)
         rarity: レアリティ（1-5）。高いほど豪華な画像を生成
 
     Returns:
@@ -217,9 +303,10 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> tuple[str, str
         # Base64エンコード
         base_image_b64 = image_to_base64(base_image_path)
 
-        # バリエーションプロンプトを生成（レアリティを考慮、3Dフィギュア風）
-        positive_prompt, negative_prompt = generate_variation_prompt(rarity)
-        logger.info(f"Generated prompt (rarity={rarity}): {positive_prompt}")
+        # バリエーションプロンプトを生成（役割・性格・レアリティを反映）
+        positive_prompt, negative_prompt = generate_variation_prompt(role, personality, rarity)
+        logger.info(f"Generated prompt for {crew_name} (role={role}, personality={personality}, rarity={rarity})")
+        logger.info(f"Prompt: {positive_prompt[:200]}...")
         logger.info(f"Negative prompt: {negative_prompt}")
 
         # Bedrock クライアント
@@ -232,13 +319,13 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> tuple[str, str
                 "images": [base_image_b64],
                 "text": positive_prompt,
                 "negativeText": negative_prompt,
-                "similarityStrength": 0.6,
+                "similarityStrength": 0.45,  # さらに下げて形状の多様性を許容
             },
             "imageGenerationConfig": {
                 "numberOfImages": 1,
                 "width": 512,
                 "height": 512,
-                "cfgScale": 9.0,
+                "cfgScale": 8.5,  # 少し下げて自然な仕上がりに
             }
         }
 
@@ -290,12 +377,19 @@ async def generate_crew_image(crew_name: str, rarity: int = 1) -> tuple[str, str
         raise
 
 
-async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> tuple[str, str | None]:
+async def generate_crew_image_with_fallback(
+    crew_name: str,
+    role: str = "Engineer",
+    personality: str = "Serious",
+    rarity: int = 1
+) -> tuple[str, str | None]:
     """
     画像生成を試み、失敗時はデフォルト画像を返す
 
     Args:
         crew_name: クルーの名前
+        role: クルーの役割
+        personality: クルーの性格
         rarity: レアリティ（1-5）
 
     Returns:
@@ -304,7 +398,7 @@ async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> 
             - image_base64: 生成された画像のBase64データ（失敗時はNone）
     """
     try:
-        return await generate_crew_image(crew_name, rarity)
+        return await generate_crew_image(crew_name, role, personality, rarity)
     except Exception as e:
         logger.warning(f"Image generation failed for {crew_name}, using default: {e}")
         # デフォルト画像をランダムに選択
@@ -320,7 +414,7 @@ async def generate_crew_image_with_fallback(crew_name: str, rarity: int = 1) -> 
 
 
 # 進化用プロンプト（Stability AI SD3.5 Large用）
-EVOLUTION_PROMPT = "A cute 3D rendered toy figure of a monster wearing a luxurious golden business suit, glowing golden aura around body, evolved powerful majestic form, keeping same color scheme, premium collectible figure, studio lighting, clean white background"
+EVOLUTION_PROMPT = "A cute 3D rendered toy figure of an AI agent character wearing a luxurious golden business suit, glowing golden aura around body, evolved powerful majestic form, keeping same color scheme, premium collectible figure, professional executive presence, studio lighting, clean white background"
 
 # 進化時の変化度合い（0.0-1.0、高いほど変化が大きい）
 EVOLUTION_STRENGTH = 0.5

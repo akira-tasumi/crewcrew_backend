@@ -14,9 +14,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine, get_db
-from models import Crew as CrewModel, TaskLog, User as UserModel, UnlockedPersonality, DailyLog, Gadget, CrewGadget, Skill, CrewSkill, Project, ProjectTask, ProjectInput
-from seed import seed_crews, seed_gadgets, seed_skills, ROLES, PERSONALITIES
-from services.bedrock_service import execute_task_with_crew, generate_greeting, route_task_with_partner, generate_whimsical_talk, generate_labor_words
+from models import Crew as CrewModel, TaskLog, User as UserModel, UnlockedPersonality, DailyLog, Gadget, CrewGadget, Skill, CrewSkill, Project, ProjectTask, ProjectInput, UserGadget
+from seed import seed_crews, seed_gadgets, seed_skills, seed_users, ROLES, PERSONALITIES
+from services.bedrock_service import execute_task_with_crew, execute_task_with_crew_and_images, generate_greeting, route_task_with_partner, generate_whimsical_talk, generate_labor_words
 from services.image_generation_service import generate_crew_image_with_fallback, evolve_crew_image
 from services.youtube import get_transcript_from_url
 from services.web_reader import fetch_web_content
@@ -25,6 +25,9 @@ from services.google_slides_service import create_presentation
 from services.google_sheets_service import create_spreadsheet, parse_table_from_text, extract_sheet_title
 from routers import slides as slides_router
 from routers import slack as slack_router
+from routers import users as users_router
+from routers import shop as shop_router
+from routers import auth as auth_router
 import re
 
 load_dotenv()
@@ -194,31 +197,32 @@ async def lifespan(app: FastAPI):
     logger.info("Creating database tables...")
     Base.metadata.create_all(bind=engine)
 
-    # マイグレーション: image_base64カラムを追加（存在しない場合）
+    # マイグレーション: 新しいカラムを追加（存在しない場合）
     logger.info("Running migrations...")
     from sqlalchemy import text
+    migrations = [
+        ("crews", "image_base64", "ALTER TABLE crews ADD COLUMN image_base64 TEXT"),
+        ("users", "username", "ALTER TABLE users ADD COLUMN username VARCHAR(50)"),
+        ("users", "hashed_password", "ALTER TABLE users ADD COLUMN hashed_password VARCHAR(255)"),
+        ("users", "is_demo", "ALTER TABLE users ADD COLUMN is_demo BOOLEAN DEFAULT 0"),
+    ]
     with engine.connect() as conn:
-        try:
-            conn.execute(text("ALTER TABLE crews ADD COLUMN image_base64 TEXT"))
-            conn.commit()
-            logger.info("Added image_base64 column to crews table")
-        except Exception as e:
-            # カラムが既に存在する場合はエラーを無視
-            if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
-                logger.info(f"Migration note: {e}")
+        for table, column, sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+                logger.info(f"Added {column} column to {table} table")
+            except Exception as e:
+                # カラムが既に存在する場合はエラーを無視（duplicate columnまたはalready existsを含む）
+                pass
 
     logger.info("Seeding initial data...")
     db = SessionLocal()
     try:
+        seed_users(db)  # 認証用ユーザー（test/demo）
         seed_skills(db)
         seed_crews(db)
         seed_gadgets(db)
-        # デフォルトユーザーを作成（存在しない場合）
-        if not db.query(UserModel).first():
-            default_user = UserModel()
-            db.add(default_user)
-            db.commit()
-            logger.info("Created default user")
     finally:
         db.close()
 
@@ -239,6 +243,9 @@ app.add_middleware(
 # ルーターを登録
 app.include_router(slides_router.router)
 app.include_router(slack_router.router)
+app.include_router(users_router.router)
+app.include_router(shop_router.router)
+app.include_router(auth_router.router)
 
 
 # --- Response Models ---
@@ -247,6 +254,9 @@ app.include_router(slack_router.router)
 class UserResponse(BaseModel):
     id: int
     company_name: str
+    user_name: str | None = None
+    job_title: str | None = None
+    avatar_data: str | None = None
     coin: int
     ruby: int
     rank: str
@@ -648,8 +658,13 @@ async def create_crew(
         logger.info(f"Using specified image: {image_url}")
     else:
         # Nova Canvas で画像を生成（失敗時はデフォルト画像）
-        logger.info(f"Generating image for crew: {request.name}")
-        image_url, image_base64 = await generate_crew_image_with_fallback(request.name)
+        logger.info(f"Generating image for crew: {request.name} (Role: {request.role}, Personality: {personality_key})")
+        image_url, image_base64 = await generate_crew_image_with_fallback(
+            crew_name=request.name,
+            role=request.role,
+            personality=personality_key,
+            rarity=1,
+        )
         logger.info(f"Generated image: {image_url}, base64: {'Yes' if image_base64 else 'No'}")
 
     new_crew = CrewModel(
@@ -776,9 +791,13 @@ async def get_user(db: Session = Depends(get_db)) -> UserResponse:
     return UserResponse(
         id=user.id,
         company_name=user.company_name,
+        user_name=user.user_name,
+        job_title=user.job_title,
+        avatar_data=user.avatar_data,
         coin=user.coin,
         ruby=user.ruby,
         rank=user.rank,
+        office_level=user.office_level,
     )
 
 
@@ -803,6 +822,32 @@ async def activate_god_mode(db: Session = Depends(get_db)):
         "message": "DEBUG MODE ACTIVATED: You are rich now!",
         "coin": user.coin,
         "ruby": user.ruby,
+    }
+
+
+class AddCoinRequest(BaseModel):
+    """コイン加算リクエスト"""
+    amount: int
+
+
+@app.post("/api/user/add-coin")
+async def add_coin(request: AddCoinRequest, db: Session = Depends(get_db)):
+    """
+    ユーザーのコインを加算（クルー独立時の祝い金など）
+    """
+    user = db.query(UserModel).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.coin += request.amount
+    db.commit()
+    db.refresh(user)
+
+    logger.info(f"Added {request.amount} coins to user. New balance: {user.coin}")
+
+    return {
+        "success": True,
+        "coin": user.coin,
     }
 
 
@@ -1168,6 +1213,210 @@ async def execute_task(
     )
 
 
+@app.post("/api/execute-task-with-files")
+async def execute_task_with_files(
+    crew_id: int = Form(...),
+    task: str = Form(...),
+    google_access_token: str | None = Form(None),
+    files: list[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+) -> ExecuteTaskResponse:
+    """
+    クルーにタスクを実行させる（ファイル添付対応版）
+
+    - crew_id: タスクを実行するクルーのID
+    - task: 実行するタスクの内容
+    - files: 添付ファイル（画像、Excel、CSV）
+    """
+    from services.file_utils import process_file, get_file_type
+
+    # クルーをDBから取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # デフォルトの性格設定
+    personality = crew.personality or "真面目で丁寧な対応を心がける。"
+
+    # 添付ファイルを処理
+    file_contexts = []
+    image_data_list = []  # 画像データ用（Vision API用）
+
+    for uploaded_file in files:
+        try:
+            file_content = await uploaded_file.read()
+            file_type = get_file_type(uploaded_file.filename or "unknown")
+
+            if file_type in ('excel', 'csv', 'text', 'json', 'xml', 'word', 'powerpoint'):
+                # テキストベースのファイルはテキスト変換
+                processed = process_file(file_content, uploaded_file.filename or "file")
+                file_contexts.append(f"\n\n【添付ファイル: {uploaded_file.filename}】\n{processed['text']}")
+                logger.info(f"Processed {file_type} file: {uploaded_file.filename}")
+
+            elif file_type == 'image':
+                # 画像はBase64エンコード
+                processed = process_file(file_content, uploaded_file.filename or "image.png")
+                image_data_list.append({
+                    'filename': uploaded_file.filename,
+                    'base64': processed['base64'],
+                    'media_type': processed['media_type'],
+                })
+                file_contexts.append(f"\n\n【添付画像: {uploaded_file.filename}】(画像を分析してください)")
+                logger.info(f"Processed image file: {uploaded_file.filename}")
+
+            elif file_type == 'pdf':
+                # PDFは既存の処理
+                from pypdf import PdfReader
+                import io as io_module
+                reader = PdfReader(io_module.BytesIO(file_content))
+                pdf_text = ""
+                for page in reader.pages[:10]:  # 最大10ページ
+                    pdf_text += page.extract_text() or ""
+                if pdf_text:
+                    file_contexts.append(f"\n\n【添付PDF: {uploaded_file.filename}】\n{pdf_text[:5000]}")
+                logger.info(f"Processed PDF file: {uploaded_file.filename}")
+
+            else:
+                file_contexts.append(f"\n\n【添付ファイル: {uploaded_file.filename}】サポートされていないファイル形式です")
+                logger.warning(f"Unsupported file type: {uploaded_file.filename}")
+
+        except Exception as e:
+            logger.error(f"File processing error: {e}")
+            file_contexts.append(f"\n\n【添付ファイル: {uploaded_file.filename}】読み込みエラー: {str(e)}")
+
+    # タスク内容にファイルコンテキストを追加
+    task_with_files = task
+    if file_contexts:
+        task_with_files = task + "\n".join(file_contexts)
+
+    # スライド作成タスクかどうかを判定
+    slide_keywords = ['スライド', 'プレゼン', 'presentation', 'slide', 'ppt', 'パワポ', 'パワーポイント']
+    is_slide_task = any(keyword in task.lower() for keyword in slide_keywords)
+
+    # シート作成タスクかどうかを判定
+    sheet_keywords_for_prompt = ['スプレッドシート', 'シート', '表', '一覧', 'リスト', 'spreadsheet', 'sheet', 'excel', 'csv']
+    is_sheet_task_for_prompt = any(keyword in task.lower() for keyword in sheet_keywords_for_prompt)
+
+    # タスク指示を拡張
+    task_for_ai = task_with_files
+
+    # シート作成タスクの場合
+    if is_sheet_task_for_prompt and not is_slide_task and google_access_token:
+        task_for_ai = f"""{task_with_files}
+
+【スプレッドシート作成の指示】
+データを整理してスプレッドシートに適した表形式で出力してください。
+
+■ 出力フォーマット（必ずMarkdown表形式で）：
+
+| 列1 | 列2 | 列3 |
+|-----|-----|-----|
+| データ1 | データ2 | データ3 |
+| データ4 | データ5 | データ6 |
+
+■ 表作成のルール：
+1. 必ずMarkdown表形式（| で区切る）で出力する
+2. 1行目はヘッダー行（項目名）にする
+3. データは具体的かつ実用的な内容にする
+4. 10〜20行程度のデータを作成する
+5. 数値データは単位を明記する（円、%、個など）"""
+
+    # スライド作成タスクの場合
+    elif is_slide_task and google_access_token:
+        task_for_ai = f"""{task_with_files}
+
+【スライド作成の指示】
+以下のフォーマットでスライド内容を生成してください。
+
+■ 出力フォーマット：
+---PAGE---
+# スライドのタイトル
+
+- ポイント1
+- ポイント2
+- ポイント3
+---PAGE---
+# 次のスライドのタイトル
+...
+
+■ ルール：
+1. 各スライドは `---PAGE---` で区切る
+2. タイトルは `#` で始める（1行目）
+3. 内容は箇条書き（`-` で始める）
+4. 5〜10枚程度のスライドを作成
+5. 具体的で分かりやすい内容にする"""
+
+    # AIにタスク実行を依頼（画像がある場合は画像付きで）
+    if image_data_list:
+        # 画像付きのBedrock呼び出し
+        result = await execute_task_with_crew_and_images(
+            crew_name=crew.name,
+            personality=personality,
+            task=task_for_ai,
+            images=image_data_list,
+        )
+    else:
+        result = await execute_task_with_crew(crew.name, crew.role or "", personality, task_for_ai)
+
+    # 以下は既存のexecute_taskと同じ処理
+    old_level = crew.level
+    old_exp = crew.exp
+    exp_gained = 15 if result["success"] else 0
+    new_exp = old_exp + exp_gained
+    new_level = old_level
+    leveled_up = False
+
+    while new_exp >= 100:
+        new_exp -= 100
+        new_level += 1
+        leveled_up = True
+
+    # コインとルビー付与
+    coin_gained = 10 if result["success"] else 0
+    ruby_gained = 5 if leveled_up else 0
+    new_coin = None
+    new_ruby = None
+
+    if result["success"]:
+        user = db.query(UserModel).first()
+        if user:
+            user.coin += coin_gained
+            if leveled_up:
+                user.ruby += ruby_gained
+            new_coin = user.coin
+            new_ruby = user.ruby
+
+        crew.exp = new_exp
+        crew.level = new_level
+
+        # TaskLogに保存
+        task_log = TaskLog(
+            crew_id=crew.id,
+            user_input=task[:2000] if task else "",
+            ai_response=result["result"][:2000] if result["result"] else "",
+            exp_gained=exp_gained,
+        )
+        db.add(task_log)
+        db.commit()
+
+    return ExecuteTaskResponse(
+        success=result["success"],
+        result=result["result"],
+        crew_name=crew.name,
+        crew_id=crew.id,
+        error=result["error"],
+        old_level=old_level,
+        new_level=new_level,
+        new_exp=new_exp,
+        exp_gained=exp_gained,
+        leveled_up=leveled_up,
+        coin_gained=coin_gained if result["success"] else None,
+        new_coin=new_coin if result["success"] else None,
+        ruby_gained=ruby_gained if leveled_up else None,
+        new_ruby=new_ruby if leveled_up else None,
+    )
+
+
 @app.post("/api/route-task")
 async def route_task(
     request: RouteTaskRequest,
@@ -1418,9 +1667,14 @@ async def scout_crew(
     personality_label = personality_info["label"]
     personality_tone = personality_info["tone"]
 
-    # AI画像生成（レアリティを渡す）
+    # AI画像生成（役割・性格・レアリティを渡す）
     logger.info(f"Scouting new crew: {name} (Role: {role}, Personality: {personality_key}, ★{rarity})")
-    image_url, image_base64 = await generate_crew_image_with_fallback(name, rarity)
+    image_url, image_base64 = await generate_crew_image_with_fallback(
+        crew_name=name,
+        role=role,
+        personality=personality_key,
+        rarity=rarity,
+    )
 
     # クルーをDBに保存
     new_crew = CrewModel(
@@ -2232,11 +2486,11 @@ async def equip_gadget(
     db: Session = Depends(get_db),
 ) -> EquipGadgetResponse:
     """
-    ガジェットを購入して装備する
+    購入済みガジェットを装備する（購入はショップで行う）
 
     - gadget_id: 装備するガジェットのID
     - slot_index: 装備するスロット（0, 1, 2）
-    - コインを消費する
+    - 他のクルーが装備中の場合は交換（スワップ）
     """
     # ユーザーを取得
     user = db.query(UserModel).first()
@@ -2269,13 +2523,28 @@ async def equip_gadget(
             error=f"スロット{request.slot_index + 1}はLv.{required_level}で解放されます（現在: Lv.{crew.level}）",
         )
 
-    # コイン残高をチェック
-    if user.coin < gadget.base_cost:
+    # ユーザーがガジェットを所持しているかチェック
+    user_gadget = db.query(UserGadget).filter(
+        UserGadget.user_id == user.id,
+        UserGadget.gadget_id == request.gadget_id,
+    ).first()
+
+    if not user_gadget:
         return EquipGadgetResponse(
             success=False,
-            error=f"コインが足りません（必要: {gadget.base_cost}、現在: {user.coin}）",
-            new_coin=user.coin,
+            error="このガジェットを所持していません。ショップで購入してください。",
         )
+
+    # 他のクルーがこのガジェットを装備中かチェック
+    other_crew_equipped = db.query(CrewGadget).filter(
+        CrewGadget.gadget_id == request.gadget_id,
+        CrewGadget.crew_id != crew_id,
+    ).first()
+
+    if other_crew_equipped:
+        # 他のクルーから装備解除
+        db.delete(other_crew_equipped)
+        logger.info(f"Unequipped gadget from crew_id={other_crew_equipped.crew_id} for swap")
 
     # 既存の装備を確認（同じスロットに装備がある場合は上書き）
     existing = db.query(CrewGadget).filter(
@@ -2287,21 +2556,21 @@ async def equip_gadget(
         # 既存装備を削除
         db.delete(existing)
 
-    # コインを消費
-    user.coin -= gadget.base_cost
+    # UserGadgetからレベルを取得（強化済みのレベルを引き継ぐ）
+    gadget_level = user_gadget.level if user_gadget else 1
 
     # 新しい装備を作成
     new_crew_gadget = CrewGadget(
         crew_id=crew_id,
         gadget_id=gadget.id,
-        level=1,
+        level=gadget_level,  # UserGadgetのレベルを引き継ぐ
         slot_index=request.slot_index,
     )
     db.add(new_crew_gadget)
     db.commit()
     db.refresh(new_crew_gadget)
 
-    logger.info(f"Equipped gadget: {gadget.name} to {crew.name} slot {request.slot_index}")
+    logger.info(f"Equipped gadget: {gadget.name} (Lv.{gadget_level}) to {crew.name} slot {request.slot_index}")
 
     return EquipGadgetResponse(
         success=True,
@@ -2379,10 +2648,18 @@ async def upgrade_gadget(
     # コインを消費
     user.coin -= upgrade_cost
 
-    # レベルアップ
+    # レベルアップ（CrewGadget）
     crew_gadget.level += 1
     new_level = crew_gadget.level
     new_effect = calculate_gadget_effect(gadget.base_effect_value, new_level)
+
+    # UserGadgetのレベルも同期（他のクルーに装備する際に引き継ぐため）
+    user_gadget = db.query(UserGadget).filter(
+        UserGadget.user_id == user.id,
+        UserGadget.gadget_id == gadget_id,
+    ).first()
+    if user_gadget:
+        user_gadget.level = new_level
 
     db.commit()
     db.refresh(crew_gadget)
@@ -2408,6 +2685,50 @@ async def upgrade_gadget(
         old_effect=old_effect,
         new_effect=new_effect,
     )
+
+
+class UnequipGadgetResponse(BaseModel):
+    success: bool
+    error: str | None = None
+
+
+@app.post("/api/crews/{crew_id}/gadgets/{gadget_id}/unequip")
+async def unequip_gadget(
+    crew_id: int,
+    gadget_id: int,
+    db: Session = Depends(get_db),
+) -> UnequipGadgetResponse:
+    """
+    装備中のガジェットを外す
+    """
+    # クルーを取得
+    crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=404, detail="Crew not found")
+
+    # 装備中のガジェットを取得
+    crew_gadget = db.query(CrewGadget).filter(
+        CrewGadget.crew_id == crew_id,
+        CrewGadget.gadget_id == gadget_id,
+    ).first()
+
+    if not crew_gadget:
+        return UnequipGadgetResponse(
+            success=False,
+            error="このガジェットは装備されていません",
+        )
+
+    # ガジェット情報をログ用に取得
+    gadget = db.query(Gadget).filter(Gadget.id == gadget_id).first()
+    gadget_name = gadget.name if gadget else f"gadget_{gadget_id}"
+
+    # 装備を削除
+    db.delete(crew_gadget)
+    db.commit()
+
+    logger.info(f"Unequipped gadget: {gadget_name} from {crew.name}")
+
+    return UnequipGadgetResponse(success=True)
 
 
 # ============================================================

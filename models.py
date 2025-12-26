@@ -19,7 +19,15 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    # 認証用フィールド
+    username: Mapped[str | None] = mapped_column(String(50), unique=True, nullable=True, index=True)  # ログインID
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)  # ハッシュ化パスワード
+    is_demo: Mapped[bool] = mapped_column(Boolean, default=False)  # デモアカウントフラグ
+    # プロフィール
     company_name: Mapped[str] = mapped_column(String(100), default="新規開拓株式会社")
+    user_name: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 担当者名
+    job_title: Mapped[str | None] = mapped_column(String(100), nullable=True)  # 役職
+    avatar_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # アバター画像(Base64)
     coin: Mapped[int] = mapped_column(Integer, default=1000)
     ruby: Mapped[int] = mapped_column(Integer, default=10)
     rank: Mapped[str] = mapped_column(String(50), default="ブロンズ")
@@ -224,3 +232,29 @@ class ProjectInput(Base):
 
     # リレーション
     project: Mapped["Project"] = relationship("Project", back_populates="inputs")
+
+
+class UserGadget(Base):
+    """ユーザーが所持しているガジェット（購入済み）"""
+    __tablename__ = "user_gadgets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    gadget_id: Mapped[int] = mapped_column(Integer, ForeignKey("gadgets.id"), nullable=False)
+    level: Mapped[int] = mapped_column(Integer, default=1, nullable=False)  # ガジェットのレベル（強化で上昇）
+    purchased_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, nullable=False
+    )
+
+
+class PersonalityItem(Base):
+    """ショップで販売する特殊性格アイテム"""
+    __tablename__ = "personality_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    personality_key: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)  # ナルシスト等
+    name: Mapped[str] = mapped_column(String(100), nullable=False)  # 表示名
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    emoji: Mapped[str] = mapped_column(String(10), nullable=False)
+    tone: Mapped[str] = mapped_column(Text, nullable=False)  # AI用の口調指示
+    ruby_price: Mapped[int] = mapped_column(Integer, nullable=False)  # ルビー価格
