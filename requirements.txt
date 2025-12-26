@@ -38,3 +38,10 @@ onnxruntime==1.17.1
 youtube-transcript-api==0.6.3
 yt-dlp==2024.12.23
 pytubefix==10.3.6
+
+# Google API
+google-api-python-client==2.154.0
+google-auth==2.36.0
+
+# Slack
+slack_sdk==3.33.4

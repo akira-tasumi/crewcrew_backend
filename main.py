@@ -21,8 +21,157 @@ from services.image_generation_service import generate_crew_image_with_fallback,
 from services.youtube import get_transcript_from_url
 from services.web_reader import fetch_web_content
 from services.pdf_reader import extract_text_from_pdf
+from services.google_slides_service import create_presentation
+from services.google_sheets_service import create_spreadsheet, parse_table_from_text, extract_sheet_title
+from routers import slides as slides_router
+from routers import slack as slack_router
+import re
 
 load_dotenv()
+
+
+# --- スライド生成ヘルパー関数 ---
+
+def _parse_slides_from_ai_output(ai_output: str) -> list[str]:
+    """
+    AIの出力からスライドのページ内容を抽出する
+
+    以下のパターンを認識:
+    1. "スライド1:", "スライド 1:", "Slide 1:" などの形式
+    2. "## スライド1" などのMarkdown見出し形式
+    3. "【スライド1】" などの括弧形式
+    4. "---" で区切られたセクション
+
+    Args:
+        ai_output: AIが生成したテキスト
+
+    Returns:
+        各スライドの内容のリスト
+    """
+    if not ai_output:
+        return []
+
+    pages = []
+
+    # パターン1: スライドX: または Slide X: 形式
+    slide_pattern = re.compile(
+        r'(?:スライド|Slide|ページ|Page)\s*(\d+)\s*[:：]\s*(.*?)(?=(?:スライド|Slide|ページ|Page)\s*\d+\s*[:：]|$)',
+        re.DOTALL | re.IGNORECASE
+    )
+    matches = slide_pattern.findall(ai_output)
+    if matches:
+        for _, content in matches:
+            cleaned = content.strip()
+            if cleaned:
+                pages.append(cleaned)
+        if pages:
+            return pages
+
+    # パターン2: Markdown見出し形式 (## スライド1)
+    markdown_pattern = re.compile(
+        r'##\s*(?:スライド|Slide|ページ|Page)?\s*(\d+)?\s*[：:]?\s*(.*?)(?=##\s*(?:スライド|Slide|ページ|Page)?|$)',
+        re.DOTALL | re.IGNORECASE
+    )
+    matches = markdown_pattern.findall(ai_output)
+    if matches and len(matches) > 1:
+        for _, content in matches:
+            cleaned = content.strip()
+            if cleaned:
+                pages.append(cleaned)
+        if pages:
+            return pages
+
+    # パターン3: 【スライド1】形式
+    bracket_pattern = re.compile(
+        r'[【\[](?:スライド|Slide|ページ|Page)\s*(\d+)[】\]]\s*(.*?)(?=[【\[](?:スライド|Slide|ページ|Page)|$)',
+        re.DOTALL | re.IGNORECASE
+    )
+    matches = bracket_pattern.findall(ai_output)
+    if matches:
+        for _, content in matches:
+            cleaned = content.strip()
+            if cleaned:
+                pages.append(cleaned)
+        if pages:
+            return pages
+
+    # パターン4: --- で区切られたセクション
+    if '---' in ai_output:
+        sections = ai_output.split('---')
+        for section in sections:
+            cleaned = section.strip()
+            if cleaned and len(cleaned) > 10:  # 短すぎるセクションは除外
+                pages.append(cleaned)
+        if len(pages) > 1:
+            return pages
+
+    # パターン5: 番号付きリスト (1. 2. 3.)
+    numbered_pattern = re.compile(r'^\s*(\d+)[.）)]\s*(.+?)(?=^\s*\d+[.）)]|\Z)', re.MULTILINE | re.DOTALL)
+    matches = numbered_pattern.findall(ai_output)
+    if matches and len(matches) >= 3:
+        for _, content in matches:
+            cleaned = content.strip()
+            if cleaned:
+                pages.append(cleaned)
+        if pages:
+            return pages
+
+    # どのパターンにもマッチしない場合: 全体を1枚のスライドとして扱う
+    # ただし改行で段落分けして複数スライドにする
+    paragraphs = ai_output.split('\n\n')
+    meaningful_paragraphs = [p.strip() for p in paragraphs if p.strip() and len(p.strip()) > 20]
+
+    if len(meaningful_paragraphs) >= 2:
+        return meaningful_paragraphs[:10]  # 最大10スライド
+    elif ai_output.strip():
+        return [ai_output.strip()]
+
+    return []
+
+
+def _extract_slide_title(task: str, ai_output: str) -> str:
+    """
+    タスク内容またはAI出力からスライドのタイトルを抽出する
+
+    Args:
+        task: ユーザーのタスク入力
+        ai_output: AIが生成した出力
+
+    Returns:
+        スライドのタイトル
+    """
+    # タスクからタイトルを抽出するパターン
+    title_patterns = [
+        r'「(.+?)」',  # 「タイトル」形式
+        r'『(.+?)』',  # 『タイトル』形式
+        r'"(.+?)"',    # "タイトル"形式
+        r'について.*(?:スライド|プレゼン)',  # 〇〇についてスライド
+        r'(.+?)の(?:スライド|プレゼン|資料)',  # 〇〇のスライド
+    ]
+
+    for pattern in title_patterns:
+        match = re.search(pattern, task)
+        if match:
+            title = match.group(1) if match.groups() else match.group(0)
+            if title and len(title) < 50:
+                return title.strip()
+
+    # AI出力の最初の行をタイトルとして使用
+    first_line = ai_output.split('\n')[0].strip() if ai_output else ""
+    # Markdown記法を除去
+    first_line = re.sub(r'^#+\s*', '', first_line)
+    first_line = re.sub(r'^\*+\s*', '', first_line)
+
+    if first_line and len(first_line) < 100:
+        return first_line[:50]
+
+    # フォールバック: タスクの最初の部分を使用
+    task_title = task[:30].strip()
+    if task_title:
+        return f"{task_title}..."
+
+    return "プレゼンテーション"
+
 
 # CORS設定: 環境変数から許可リストを取得（デフォルトは全許可）
 def get_cors_origins() -> list[str]:
@@ -87,6 +236,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ルーターを登録
+app.include_router(slides_router.router)
+app.include_router(slack_router.router)
+
 
 # --- Response Models ---
 
@@ -145,6 +298,7 @@ class PartnerResponse(BaseModel):
 class ExecuteTaskRequest(BaseModel):
     crew_id: int
     task: str
+    google_access_token: str | None = None  # Google認証トークン（スライド生成時に使用）
 
 
 class ExecuteTaskResponse(BaseModel):
@@ -165,6 +319,12 @@ class ExecuteTaskResponse(BaseModel):
     # ルビー報酬（レベルアップ時）
     ruby_gained: int | None = None  # 獲得ルビー
     new_ruby: int | None = None     # 新しいルビー残高
+    # スライド生成結果
+    slide_url: str | None = None  # 生成されたスライドのURL
+    slide_id: str | None = None   # 生成されたスライドのID
+    # スプレッドシート生成結果
+    sheet_url: str | None = None  # 生成されたシートのURL
+    sheet_id: str | None = None   # 生成されたシートのID
 
 
 class RouteTaskRequest(BaseModel):
@@ -774,13 +934,81 @@ async def execute_task(
     # デフォルトの性格設定
     personality = crew.personality or "真面目で丁寧な対応を心がける。"
 
+    # スライド作成タスクかどうかを判定
+    slide_keywords = ['スライド', 'プレゼン', 'presentation', 'slide', 'ppt', 'パワポ', 'パワーポイント']
+    is_slide_task = any(keyword in request.task.lower() for keyword in slide_keywords)
+
+    # シート作成タスクかどうかを判定（プロンプト拡張用）
+    sheet_keywords_for_prompt = ['スプレッドシート', 'シート', '表', '一覧', 'リスト', 'spreadsheet', 'sheet', 'excel', 'csv']
+    is_sheet_task_for_prompt = any(keyword in request.task.lower() for keyword in sheet_keywords_for_prompt)
+
+    # タスク指示を拡張
+    task_for_ai = request.task
+
+    # シート作成タスクの場合（スライドより先に判定）
+    if is_sheet_task_for_prompt and not is_slide_task and request.google_access_token:
+        task_for_ai = f"""{request.task}
+
+【スプレッドシート作成の指示】
+データを整理してスプレッドシートに適した表形式で出力してください。
+
+■ 出力フォーマット（必ずMarkdown表形式で）：
+
+| 列1 | 列2 | 列3 |
+|-----|-----|-----|
+| データ1 | データ2 | データ3 |
+| データ4 | データ5 | データ6 |
+
+■ 表作成のルール：
+1. 必ずMarkdown表形式（| で区切る）で出力する
+2. 1行目はヘッダー行（項目名）にする
+3. データは具体的かつ実用的な内容にする
+4. 10〜20行程度のデータを作成する
+5. 数値データは単位を明記する（円、%、個など）"""
+
+    # スライド作成タスクの場合
+    elif is_slide_task and request.google_access_token:
+        task_for_ai = f"""{request.task}
+
+【プレゼンテーション作成の指示】
+魅力的で説得力のあるスライドを作成してください。以下の形式で出力してください：
+
+■ 出力フォーマット（必ずこの形式で）：
+
+スライド1: [インパクトのあるタイトル]
+📌 キーメッセージ
+• ポイント1（具体的な数字やデータがあれば含める）
+• ポイント2
+• ポイント3
+
+スライド2: [セクションタイトル]
+💡 サブタイトルや補足
+• 要点を簡潔に（1行20文字以内推奨）
+• 具体例や事例があれば追加
+• 数値データは「〇〇%」「〇〇倍」など強調
+
+■ スライド作成のルール：
+1. 各スライドは「スライドN:」で始める
+2. 1スライドあたり3〜5個の箇条書き（多すぎない）
+3. 絵文字を見出しに1つ使用（📌💡🎯✅📊🚀💪🔑📈など）
+4. 数字やデータは具体的に（「多い」ではなく「80%」など）
+5. 最後のスライドはまとめ or アクションを促す内容
+6. 5〜8枚程度のスライドを作成
+
+■ スライド構成の参考：
+- スライド1: タイトル + サブタイトル
+- スライド2: 課題・背景
+- スライド3-5: 主要ポイント（各1テーマ）
+- スライド6-7: 具体例・データ
+- スライド8: まとめ・次のアクション"""
+
     # Bedrock APIでタスクを実行
     logger.info(f"Executing task with Bedrock: crew={crew.name}, personality={personality[:20]}...")
     result = await execute_task_with_crew(
         crew_name=crew.name,
         crew_role=crew.role,
         personality=personality,
-        task=request.task,
+        task=task_for_ai,
     )
 
     # EXP/レベル情報
@@ -854,6 +1082,70 @@ async def execute_task(
             f"Level: {old_level} -> {new_level}, EXP: {new_exp}, LeveledUp: {leveled_up}"
         )
 
+    # スライド生成の実行（is_slide_taskは上で既に判定済み）
+    slide_url = None
+    slide_id = None
+
+    if result["success"] and is_slide_task and request.google_access_token:
+        logger.info(f"Detected slide creation task. Attempting to create Google Slides...")
+        try:
+            # AIの出力からスライドのページを抽出
+            ai_output = result["result"] or ""
+            pages = _parse_slides_from_ai_output(ai_output)
+
+            if pages:
+                # タイトルを抽出（タスクから生成）
+                title = _extract_slide_title(request.task, ai_output)
+
+                # Google Slidesを作成
+                slide_result = create_presentation(
+                    access_token=request.google_access_token,
+                    title=title,
+                    pages=pages
+                )
+                slide_url = slide_result["presentationUrl"]
+                slide_id = slide_result["presentationId"]
+                logger.info(f"Google Slides created successfully: {slide_url}")
+
+                # 結果にスライドURLを追加
+                result["result"] = f"{ai_output}\n\n📊 **Googleスライドを作成しました！**\n{slide_url}"
+            else:
+                logger.warning("Could not parse slides from AI output")
+        except Exception as e:
+            logger.error(f"Failed to create Google Slides: {e}")
+            # スライド作成に失敗しても、テキスト結果は返す
+
+    # スプレッドシート生成の実行
+    sheet_url = None
+    sheet_id = None
+    sheet_keywords = ['スプレッドシート', 'シート', '表', '一覧', 'リスト', 'spreadsheet', 'sheet', 'excel', 'csv']
+    is_sheet_task = any(keyword in request.task.lower() for keyword in sheet_keywords)
+
+    # スライドタスクではない場合のみシート生成を試みる
+    if result["success"] and is_sheet_task and not is_slide_task and request.google_access_token:
+        logger.info(f"Detected sheet creation task. Attempting to create Google Sheets...")
+        try:
+            ai_output = result["result"] or ""
+            table_data = parse_table_from_text(ai_output)
+
+            if table_data:
+                title = extract_sheet_title(request.task, ai_output)
+                sheet_result = create_spreadsheet(
+                    access_token=request.google_access_token,
+                    title=title,
+                    data=table_data
+                )
+                sheet_url = sheet_result["spreadsheetUrl"]
+                sheet_id = sheet_result["spreadsheetId"]
+                logger.info(f"Google Sheets created successfully: {sheet_url}")
+
+                # 結果にシートURLを追加
+                result["result"] = f"{ai_output}\n\n📋 **Googleスプレッドシートを作成しました！**\n{sheet_url}"
+            else:
+                logger.warning("Could not parse table data from AI output")
+        except Exception as e:
+            logger.error(f"Failed to create Google Sheets: {e}")
+
     return ExecuteTaskResponse(
         success=result["success"],
         result=result["result"],
@@ -869,6 +1161,10 @@ async def execute_task(
         new_coin=new_coin if result["success"] else None,
         ruby_gained=ruby_gained if leveled_up else None,
         new_ruby=new_ruby if leveled_up else None,
+        slide_url=slide_url,
+        slide_id=slide_id,
+        sheet_url=sheet_url,
+        sheet_id=sheet_id,
     )
 
 
@@ -3088,11 +3384,13 @@ async def execute_project_stream(
     required_inputs_json: str = Form(...),
     tasks_json: str = Form(...),
     input_values_json: str = Form(...),
+    google_access_token: Optional[str] = Form(None),
     files: Optional[list[UploadFile]] = File(None),
     db: Session = Depends(get_db),
 ):
     """
     プロジェクトを実行し、SSEでタスクごとに進捗を返す
+    スライド作成タスクの場合はGoogle Slides APIでスライドを生成
     """
     from starlette.responses import StreamingResponse
     from services.pdf_reader import extract_text_from_pdf
@@ -3186,6 +3484,14 @@ async def execute_project_stream(
                 for key, value in context.items():
                     processed_instruction = processed_instruction.replace(f"{{{key}}}", value)
 
+                # スライド作成タスクかどうかを判定
+                slide_keywords = ['スライド', 'プレゼン', 'presentation', 'slide', 'ppt', 'パワポ', 'パワーポイント']
+                is_slide_task = any(keyword in processed_instruction.lower() for keyword in slide_keywords)
+
+                # シート作成タスクかどうかを判定
+                sheet_keywords = ['スプレッドシート', 'シート', '表', '一覧', 'リスト', 'spreadsheet', 'sheet', 'excel', 'csv']
+                is_sheet_task = any(keyword in processed_instruction.lower() for keyword in sheet_keywords)
+
                 # プロンプト構築
                 system_prompt = f"""あなたは「{crew_name}」という名前のクルー（社員）です。
 役割: {role}
@@ -3194,8 +3500,56 @@ async def execute_project_stream(
 あなたはプロジェクトチームの一員として、与えられたタスクを遂行してください。
 前のタスクの成果物がある場合は、それを参考にして作業を進めてください。"""
 
+                # タスク指示を拡張
+                task_instruction = processed_instruction
+
+                # シート作成タスクの場合（スライドより先に判定）
+                if is_sheet_task and not is_slide_task and google_access_token:
+                    task_instruction += """
+
+【スプレッドシート作成の指示】
+データを整理してスプレッドシートに適した表形式で出力してください。
+
+■ 出力フォーマット（必ずMarkdown表形式で）：
+
+| 列1 | 列2 | 列3 |
+|-----|-----|-----|
+| データ1 | データ2 | データ3 |
+
+■ 表作成のルール：
+1. 必ずMarkdown表形式（| で区切る）で出力する
+2. 1行目はヘッダー行（項目名）にする
+3. 10〜20行程度のデータを作成する"""
+
+                # スライド作成タスクの場合
+                elif is_slide_task and google_access_token:
+                    task_instruction += """
+
+【プレゼンテーション作成の指示】
+魅力的で説得力のあるスライドを作成してください。以下の形式で出力してください：
+
+■ 出力フォーマット（必ずこの形式で）：
+
+スライド1: [インパクトのあるタイトル]
+📌 キーメッセージ
+• ポイント1（具体的な数字やデータがあれば含める）
+• ポイント2
+• ポイント3
+
+スライド2: [セクションタイトル]
+💡 サブタイトルや補足
+• 要点を簡潔に
+• 具体例や事例
+• 数値データは「〇〇%」など強調
+
+■ スライド作成のルール：
+1. 各スライドは「スライドN:」で始める
+2. 1スライドあたり3〜5個の箇条書き
+3. 絵文字を見出しに1つ使用（📌💡🎯✅📊🚀💪など）
+4. 5〜8枚程度のスライドを作成"""
+
                 user_prompt = f"""## あなたのタスク
-{processed_instruction}
+{task_instruction}
 
 """
                 if previous_output:
@@ -3226,6 +3580,53 @@ async def execute_project_stream(
                     response_body = json.loads(response["body"].read())
                     result_text = response_body["content"][0]["text"]
 
+                    # スライド生成（スライドタスク + Google認証済みの場合）
+                    slide_url = None
+                    slide_id = None
+                    if is_slide_task and google_access_token:
+                        try:
+                            logger.info(f"Attempting to create Google Slides for task {idx + 1}...")
+                            pages = _parse_slides_from_ai_output(result_text)
+                            if pages:
+                                title = _extract_slide_title(instruction, result_text)
+                                slide_result = create_presentation(
+                                    access_token=google_access_token,
+                                    title=title,
+                                    pages=pages
+                                )
+                                slide_url = slide_result["presentationUrl"]
+                                slide_id = slide_result["presentationId"]
+                                logger.info(f"Google Slides created: {slide_url}")
+                                # 結果にスライドURLを追加
+                                result_text = f"{result_text}\n\n📊 **Googleスライドを作成しました！**\n{slide_url}"
+                            else:
+                                logger.warning("Could not parse slides from AI output")
+                        except Exception as slide_error:
+                            logger.error(f"Failed to create Google Slides: {slide_error}")
+
+                    # シート生成（シートタスク + Google認証済み + スライドタスクではない場合）
+                    sheet_url = None
+                    sheet_id = None
+                    if is_sheet_task and not is_slide_task and google_access_token:
+                        try:
+                            logger.info(f"Attempting to create Google Sheets for task {idx + 1}...")
+                            table_data = parse_table_from_text(result_text)
+                            if table_data:
+                                title = extract_sheet_title(instruction, result_text)
+                                sheet_result = create_spreadsheet(
+                                    access_token=google_access_token,
+                                    title=title,
+                                    data=table_data
+                                )
+                                sheet_url = sheet_result["spreadsheetUrl"]
+                                sheet_id = sheet_result["spreadsheetId"]
+                                logger.info(f"Google Sheets created: {sheet_url}")
+                                result_text = f"{result_text}\n\n📋 **Googleスプレッドシートを作成しました！**\n{sheet_url}"
+                            else:
+                                logger.warning("Could not parse table data from AI output")
+                        except Exception as sheet_error:
+                            logger.error(f"Failed to create Google Sheets: {sheet_error}")
+
                     task_result = {
                         "task_index": idx,
                         "role": role,
@@ -3233,7 +3634,11 @@ async def execute_project_stream(
                         "crew_image": crew_image,
                         "instruction": instruction,
                         "result": result_text,
-                        "status": "completed"
+                        "status": "completed",
+                        "slide_url": slide_url,
+                        "slide_id": slide_id,
+                        "sheet_url": sheet_url,
+                        "sheet_id": sheet_id
                     }
                     task_results.append(task_result)
                     previous_output = result_text
