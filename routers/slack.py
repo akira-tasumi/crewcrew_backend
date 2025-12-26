@@ -52,7 +52,7 @@ def verify_slack_signature(request_body: bytes, timestamp: str, signature: str) 
     return hmac.compare_digest(my_signature, signature)
 
 
-async def process_mention(channel: str, user: str, text: str, ts: str):
+def process_mention(channel: str, user: str, text: str, ts: str):
     """
     メンションを処理してSlackに返信する（バックグラウンド処理）
 
@@ -62,30 +62,39 @@ async def process_mention(channel: str, user: str, text: str, ts: str):
         text: メンションのテキスト
         ts: メッセージのタイムスタンプ
     """
+    print(f"[Slack] process_mention started - channel: {channel}, token exists: {bool(SLACK_BOT_TOKEN)}")
+
+    if not SLACK_BOT_TOKEN:
+        print("[Slack] Error: SLACK_BOT_TOKEN is not set")
+        return
+
     try:
         client = WebClient(token=SLACK_BOT_TOKEN)
 
         # メンションから@CrewCrewを除去してタスク内容を取得
         task_text = text.replace("<@", "").split(">", 1)[-1].strip()
 
+        print(f"[Slack] Sending message to channel {channel}...")
+
         # 受付完了メッセージを送信
-        client.chat_postMessage(
+        response = client.chat_postMessage(
             channel=channel,
-            text=f"[受付完了] クルーに依頼しました！\n\n依頼内容: {task_text if task_text else '(内容なし)'}",
+            text=f"クルーが依頼を受け付けました！\n\n依頼内容: {task_text if task_text else '(内容なし)'}",
             thread_ts=ts  # スレッドで返信
         )
 
-        print(f"[Slack] Sent acknowledgment to channel {channel}")
+        print(f"[Slack] Message sent successfully: {response['ok']}")
 
         # TODO: ここで実際のクルー処理を呼び出す
         # from services.bedrock_service import execute_task_with_crew
-        # result = await execute_task_with_crew(task_text, ...)
+        # result = execute_task_with_crew(task_text, ...)
         # client.chat_postMessage(channel=channel, text=result, thread_ts=ts)
 
     except SlackApiError as e:
         print(f"[Slack] API Error: {e.response['error']}")
+        print(f"[Slack] Full error response: {e.response}")
     except Exception as e:
-        print(f"[Slack] Unexpected error: {e}")
+        print(f"[Slack] Unexpected error: {type(e).__name__}: {e}")
 
 
 @router.post("/events")
