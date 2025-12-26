@@ -76,14 +76,13 @@ def process_mention(channel: str, user: str, text: str, ts: str):
 
         print(f"[Slack] Sending message to channel {channel}...")
 
-        # 受付完了メッセージを送信
+        # 受付完了メッセージを送信（チャンネルに直接投稿）
         response = client.chat_postMessage(
             channel=channel,
-            text=f"クルーが依頼を受け付けました！\n\n依頼内容: {task_text if task_text else '(内容なし)'}",
-            thread_ts=ts  # スレッドで返信
+            text=f"<@{user}> クルーが依頼を受け付けました！\n\n依頼内容: {task_text if task_text else '(内容なし)'}"
         )
 
-        print(f"[Slack] Message sent successfully: {response['ok']}")
+        print(f"[Slack] Message sent successfully: {response['ok']}, ts: {response.get('ts', 'N/A')}")
 
         # TODO: ここで実際のクルー処理を呼び出す
         # from services.bedrock_service import execute_task_with_crew

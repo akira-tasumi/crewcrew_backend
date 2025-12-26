@@ -3471,13 +3471,29 @@ async def execute_project_stream(
                 crew_image = task["assigned_crew_image"]
                 instruction = task["instruction"]
 
+                # クルー情報を取得（削除されている可能性があるため確認）
+                crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+
+                # クルーが存在しない場合（削除済み）は別のクルーにフォールバック
+                if not crew:
+                    # 最初に見つかったクルーを代わりに割り当て
+                    fallback_crew = db.query(CrewModel).first()
+                    if fallback_crew:
+                        crew = fallback_crew
+                        crew_id = crew.id
+                        crew_name = crew.name
+                        crew_image = crew.image_url
+                        logger.warning(f"Crew {task['assigned_crew_id']} not found. Fallback to {crew.name}")
+                    else:
+                        # クルーが1人もいない場合はエラー
+                        yield f"data: {json.dumps({'type': 'error', 'error': 'クルーが見つかりません'})}\n\n"
+                        return
+
+                personality = crew.personality if crew else ""
+
                 # 開始通知を送信
                 yield f"data: {json.dumps({'type': 'task_start', 'task_index': idx, 'crew_name': crew_name, 'role': role})}\n\n"
                 await asyncio.sleep(0)  # イベントループに制御を戻してフラッシュ
-
-                # クルー情報を取得
-                crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
-                personality = crew.personality if crew else ""
 
                 # 変数置換
                 processed_instruction = instruction
@@ -3627,10 +3643,50 @@ async def execute_project_stream(
                         except Exception as sheet_error:
                             logger.error(f"Failed to create Google Sheets: {sheet_error}")
 
+                    # EXP付与とTaskLog保存（クルーが存在する場合）
+                    exp_gained = 0
+                    leveled_up = False
+                    old_level = crew.level if crew else 1
+                    new_level = old_level
+                    new_exp = crew.exp if crew else 0
+
+                    if crew:
+                        exp_gained = 15  # +15 EXP（固定）
+                        crew.exp += exp_gained
+
+                        # レベルアップ判定（100 EXP で 1 レベルアップ）
+                        if crew.exp >= 100:
+                            crew.exp -= 100
+                            crew.level += 1
+                            leveled_up = True
+
+                        new_exp = crew.exp
+                        new_level = crew.level
+
+                        # TaskLogを保存
+                        task_log = TaskLog(
+                            crew_id=crew.id,
+                            user_input=f"[プロジェクト: {project_title}] {instruction}",
+                            ai_response=result_text[:1000],  # 長すぎる場合は切り詰め
+                            exp_gained=exp_gained,
+                        )
+                        db.add(task_log)
+
+                        # コイン報酬（50コイン）
+                        user = db.query(UserModel).first()
+                        if user:
+                            user.coin += 50
+                            if leveled_up:
+                                user.ruby += 5
+
+                        db.commit()
+                        logger.info(f"Added {exp_gained} EXP to {crew_name}. Level: {old_level} -> {new_level}")
+
                     task_result = {
                         "task_index": idx,
                         "role": role,
                         "crew_name": crew_name,
+                        "crew_id": crew_id,
                         "crew_image": crew_image,
                         "instruction": instruction,
                         "result": result_text,
@@ -3638,7 +3694,12 @@ async def execute_project_stream(
                         "slide_url": slide_url,
                         "slide_id": slide_id,
                         "sheet_url": sheet_url,
-                        "sheet_id": sheet_id
+                        "sheet_id": sheet_id,
+                        "exp_gained": exp_gained,
+                        "old_level": old_level,
+                        "new_level": new_level,
+                        "new_exp": new_exp,
+                        "leveled_up": leveled_up,
                     }
                     task_results.append(task_result)
                     previous_output = result_text
