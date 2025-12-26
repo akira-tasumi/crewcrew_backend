@@ -134,8 +134,11 @@ async def handle_slack_events(request: Request, background_tasks: BackgroundTask
 
         print(f"[Slack] Received mention from {user} in {channel}: {text}")
 
-        # バックグラウンドで処理（3秒タイムアウト回避）
-        background_tasks.add_task(process_mention, channel, user, text, ts)
+        # 直接実行（デバッグ用）
+        try:
+            process_mention(channel, user, text, ts)
+        except Exception as e:
+            print(f"[Slack] Error in process_mention: {e}")
 
         # 即時レスポンス
         return {"status": "ok"}
