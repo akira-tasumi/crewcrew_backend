@@ -258,3 +258,24 @@ class PersonalityItem(Base):
     emoji: Mapped[str] = mapped_column(String(10), nullable=False)
     tone: Mapped[str] = mapped_column(Text, nullable=False)  # AI用の口調指示
     ruby_price: Mapped[int] = mapped_column(Integer, nullable=False)  # ルビー価格
+
+
+class SavedProject(Base):
+    """保存されたプロジェクトテンプレート（ディレクターモード用）"""
+    __tablename__ = "saved_projects"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_template: Mapped[str] = mapped_column(Text, nullable=False)  # 保存された指示内容
+    crew_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("crews.id"), nullable=True)  # nullなら自動選択
+    is_favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)  # 実行回数
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, onupdate=now_jst, nullable=False
+    )

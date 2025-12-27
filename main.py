@@ -17,6 +17,7 @@ from database import Base, SessionLocal, engine, get_db
 from models import Crew as CrewModel, TaskLog, User as UserModel, UnlockedPersonality, DailyLog, Gadget, CrewGadget, Skill, CrewSkill, Project, ProjectTask, ProjectInput, UserGadget
 from seed import seed_crews, seed_gadgets, seed_skills, seed_users, ROLES, PERSONALITIES
 from services.bedrock_service import execute_task_with_crew, execute_task_with_crew_and_images, generate_greeting, route_task_with_partner, generate_whimsical_talk, generate_labor_words
+from graphs import run_director_workflow
 from services.image_generation_service import generate_crew_image_with_fallback, evolve_crew_image
 from services.youtube import get_transcript_from_url
 from services.web_reader import fetch_web_content
@@ -28,6 +29,8 @@ from routers import slack as slack_router
 from routers import users as users_router
 from routers import shop as shop_router
 from routers import auth as auth_router
+from routers import saved_projects as saved_projects_router
+from routers import research as research_router
 import re
 
 load_dotenv()
@@ -246,6 +249,8 @@ app.include_router(slack_router.router)
 app.include_router(users_router.router)
 app.include_router(shop_router.router)
 app.include_router(auth_router.router)
+app.include_router(saved_projects_router.router)
+app.include_router(research_router.router)
 
 
 # --- Response Models ---
@@ -2917,7 +2922,9 @@ async def summarize_web_article(
 • ポイント2: ...
 • ポイント3: ..."""
 
-        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+        from botocore.config import Config
+        bedrock_config = Config(read_timeout=300, connect_timeout=10, retries={'max_attempts': 2})
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1", config=bedrock_config)
 
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
@@ -3142,7 +3149,9 @@ async def summarize_pdf_file(
 • ポイント3: ...
 （必要に応じて追加）"""
 
-        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+        from botocore.config import Config
+        bedrock_config = Config(read_timeout=300, connect_timeout=10, retries={'max_attempts': 2})
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1", config=bedrock_config)
 
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
@@ -3314,8 +3323,8 @@ async def create_project_plan(
         crew_info_json = json.dumps(crew_info_list, ensure_ascii=False, indent=2)
 
         # 3. Bedrockでプロジェクト計画を生成
-        prompt = f"""あなたは優秀なプロジェクトマネージャーです。
-ユーザーの目標を達成するために、以下のクルー（社員）を最適に割り当てたタスクリストを作成してください。
+        prompt = f"""あなたは効率的なプロジェクトマネージャーです。
+ユーザーの目標を達成するために、最小限のタスクで最大の成果を出すプランを作成してください。
 
 ## ユーザーの目標
 {request.user_goal}
@@ -3323,10 +3332,23 @@ async def create_project_plan(
 ## 利用可能なクルー
 {crew_info_json}
 
-## あなたのタスク
-1. ゴールを達成するための具体的な「タスクリスト」を作成してください（2〜5個程度）
-2. 各タスクに「最適なクルー」を割り当ててください（スキルや役割を考慮）
-3. 実行にあたってユーザーから受け取る必要がある「不足情報（Input Requirements）」を特定してください
+## プラン作成のルール（厳守）
+1. **タスクは1〜2個が基本**（絶対に3個以上作らない）
+   - 単純な作成タスク → 1タスク
+   - 作成＋変換（例：記事執筆→HTML化）→ 2タスク
+   - 情報収集・校正などの事前/事後作業は不要
+2. **フォーマット変換は別タスクにする**
+   - ユーザーが「HTMLで」「WordPress用に」等を指示 → 「執筆」+「HTML変換」の2タスク
+   - ユーザーが「スライド化」「Excel化」等を指示 → 「作成」+「変換」の2タスク
+3. 各タスクに最適なクルーを1人ずつ割り当てる（異なるクルーを使う）
+4. **required_inputs は積極的に設定する**（成果物の品質向上のため）
+   - 記事作成 → 「想定読者層」「希望文字数」「トーン（カジュアル/フォーマル）」など
+   - 資料作成 → 「対象者」「用途」「ページ数目安」など
+   - 分析系 → 「分析の観点」「重視するポイント」など
+
+## 重要：成果物の文体について
+記事・レポート・資料などのビジネス文書を作成する場合は、instructionに以下を必ず含めてください：
+「※成果物は丁寧語・敬体で記述し、口語表現（だぜ、っす、じゃん等）は使用しないこと」
 
 ## 出力形式（必ずこのJSON形式で出力）
 ```json
@@ -3346,12 +3368,14 @@ async def create_project_plan(
 ```
 
 ## 注意事項
-- typeは "file"（ファイルアップロード）, "url"（URL入力）, "text"（テキスト入力）のいずれか
+- typeは "file", "url", "text" のいずれか
 - instructionには必要に応じて {{key}} でインプットを参照
 - タスクは実行順に並べる
-- 必ず有効なJSONのみを出力（説明文は不要）"""
+- 必ず有効なJSONのみを出力"""
 
-        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+        from botocore.config import Config
+        bedrock_config = Config(read_timeout=300, connect_timeout=10, retries={'max_attempts': 2})
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1", config=bedrock_config)
 
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
@@ -3655,8 +3679,10 @@ async def execute_project(
         task_results: list[ExecuteProjectTaskResult] = []
         previous_output = ""
 
-        # Bedrockクライアント
-        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+        # Bedrockクライアント（タイムアウトを延長: デフォルト60秒→5分）
+        from botocore.config import Config
+        bedrock_config = Config(read_timeout=300, connect_timeout=10, retries={'max_attempts': 2})
+        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1", config=bedrock_config)
 
         for idx, task in enumerate(tasks):
             role = task["role"]
@@ -3879,7 +3905,14 @@ async def execute_project_stream(
             task_results = []
             previous_output = ""
 
-            bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+            # タイムアウトを延長（デフォルト60秒→5分）
+            from botocore.config import Config
+            bedrock_config = Config(
+                read_timeout=300,  # 5分
+                connect_timeout=10,
+                retries={'max_attempts': 2}
+            )
+            bedrock = boto3.client("bedrock-runtime", region_name="us-east-1", config=bedrock_config)
 
             for idx, task in enumerate(tasks):
                 role = task["role"]
@@ -4176,6 +4209,465 @@ async def execute_project_stream(
 
         except Exception as e:
             logger.error(f"Execute project stream error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+
+# ============================================================
+# LangGraph ベースのディレクターモード（自己修正ループ）
+# ============================================================
+
+class LangGraphDirectorRequest(BaseModel):
+    """LangGraphディレクターモードのリクエスト"""
+    task: str
+    crew_id: Optional[int] = None  # 指定しない場合は相棒を使用
+    max_revisions: int = 3
+
+
+class LangGraphDirectorResponse(BaseModel):
+    """LangGraphディレクターモードのレスポンス"""
+    success: bool
+    final_result: Optional[str] = None
+    score: int = 0
+    critique: str = ""
+    revision_count: int = 0
+    crew_name: Optional[str] = None
+    error: Optional[str] = None
+
+
+@app.post("/api/director/langgraph", response_model=LangGraphDirectorResponse)
+async def execute_langgraph_director(
+    request: LangGraphDirectorRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    LangGraphベースのディレクターモード（自己修正ループ）
+
+    クルーが成果物を作成 → ディレクターが評価 → 80点未満なら修正指示 → 再作成
+    このループを最大max_revisions回繰り返し、品質の高い成果物を生成する。
+
+    Features:
+    - 自動品質評価（0-100点スコアリング）
+    - 改善フィードバックの自動生成
+    - 最大修正回数の制限
+    - クルーの性格を反映した回答
+
+    Args:
+        request: タスク内容、クルーID（オプション）、最大修正回数
+
+    Returns:
+        最終成果物、スコア、評価コメント、修正回数
+    """
+    logger.info(f"[LangGraph Director] Request: task={request.task[:50]}..., crew_id={request.crew_id}")
+
+    try:
+        # クルーを取得（指定がなければ相棒を使用）
+        if request.crew_id:
+            crew = db.query(CrewModel).filter(CrewModel.id == request.crew_id).first()
+            if not crew:
+                return LangGraphDirectorResponse(
+                    success=False,
+                    error=f"クルーID {request.crew_id} が見つかりません",
+                )
+        else:
+            # 相棒を取得
+            crew = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+            if not crew:
+                return LangGraphDirectorResponse(
+                    success=False,
+                    error="相棒が設定されていません。先に相棒を任命してください。",
+                )
+
+        logger.info(f"[LangGraph Director] Using crew: {crew.name} (ID: {crew.id})")
+
+        # LangGraphワークフローを実行
+        result = await run_director_workflow(
+            task=request.task,
+            crew_name=crew.name,
+            crew_personality=crew.personality or "",
+            max_revisions=request.max_revisions,
+        )
+
+        if result["success"]:
+            # タスクログを記録
+            try:
+                task_log = TaskLog(
+                    crew_id=crew.id,
+                    task=f"[LangGraph Director] {request.task[:200]}",
+                    result=result["final_result"][:2000] if result["final_result"] else None,
+                    status="completed",
+                    exp_earned=15,  # ディレクターモードは通常より多めのEXP
+                )
+                db.add(task_log)
+
+                # EXP付与
+                crew.exp += 15
+                if crew.exp >= crew.level * 100:
+                    crew.exp -= crew.level * 100
+                    crew.level += 1
+                    logger.info(f"[LangGraph Director] {crew.name} leveled up to {crew.level}!")
+
+                db.commit()
+            except Exception as db_error:
+                logger.warning(f"[LangGraph Director] Failed to save task log: {db_error}")
+
+            return LangGraphDirectorResponse(
+                success=True,
+                final_result=result["final_result"],
+                score=result["score"],
+                critique=result["critique"],
+                revision_count=result["revision_count"],
+                crew_name=result["crew_name"],
+                error=None,
+            )
+        else:
+            return LangGraphDirectorResponse(
+                success=False,
+                error=result.get("error", "Unknown error"),
+            )
+
+    except Exception as e:
+        logger.error(f"[LangGraph Director] Error: {e}")
+        return LangGraphDirectorResponse(
+            success=False,
+            error=str(e),
+        )
+
+
+@app.post("/api/director/langgraph-stream")
+async def execute_langgraph_director_stream(
+    request: LangGraphDirectorRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    LangGraphベースのディレクターモード（SSEストリーミング版）
+
+    進捗をリアルタイムで通知しながら実行する。
+
+    Events:
+    - start: 実行開始
+    - draft: 成果物作成完了
+    - evaluation: 評価完了
+    - revision: 修正開始
+    - complete: 全体完了
+    - error: エラー発生
+    """
+    from fastapi.responses import StreamingResponse
+
+    async def generate():
+        try:
+            # クルーを取得
+            if request.crew_id:
+                crew = db.query(CrewModel).filter(CrewModel.id == request.crew_id).first()
+                if not crew:
+                    yield f"data: {json.dumps({'type': 'error', 'error': f'クルーID {request.crew_id} が見つかりません'})}\n\n"
+                    return
+            else:
+                crew = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
+                if not crew:
+                    yield f"data: {json.dumps({'type': 'error', 'error': '相棒が設定されていません'})}\n\n"
+                    return
+
+            # 開始イベント
+            yield f"data: {json.dumps({'type': 'start', 'crew_name': crew.name, 'max_revisions': request.max_revisions})}\n\n"
+
+            # LangGraphワークフローを実行（進捗を通知）
+            from graphs.workflow import build_director_graph
+            from graphs.state import create_initial_state
+
+            app_graph = build_director_graph().compile()
+            initial_state = create_initial_state(
+                task=request.task,
+                crew_name=crew.name,
+                crew_personality=crew.personality or "",
+                max_revisions=request.max_revisions,
+            )
+
+            final_state = None
+            async for state in app_graph.astream(initial_state):
+                for node_name, node_state in state.items():
+                    final_state = node_state
+
+                    if node_name == "generator":
+                        yield f"data: {json.dumps({'type': 'draft', 'revision': node_state.get('revision_count', 0), 'draft_preview': node_state.get('draft', '')[:200]})}\n\n"
+                    elif node_name == "reflector":
+                        yield f"data: {json.dumps({'type': 'evaluation', 'score': node_state.get('score', 0), 'critique': node_state.get('critique', ''), 'is_complete': node_state.get('is_complete', False)})}\n\n"
+
+                        if not node_state.get('is_complete', False):
+                            yield f"data: {json.dumps({'type': 'revision', 'next_revision': node_state.get('revision_count', 0) + 1})}\n\n"
+
+            if final_state:
+                # タスクログを記録
+                try:
+                    task_log = TaskLog(
+                        crew_id=crew.id,
+                        task=f"[LangGraph Director] {request.task[:200]}",
+                        result=final_state.get("final_result", final_state.get("draft", ""))[:2000],
+                        status="completed",
+                        exp_earned=15,
+                    )
+                    db.add(task_log)
+                    crew.exp += 15
+                    if crew.exp >= crew.level * 100:
+                        crew.exp -= crew.level * 100
+                        crew.level += 1
+                    db.commit()
+                except Exception as db_error:
+                    logger.warning(f"[LangGraph Director Stream] DB error: {db_error}")
+
+                # 完了イベント
+                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'final_result': final_state.get('final_result') or final_state.get('draft', ''), 'score': final_state.get('score', 0), 'critique': final_state.get('critique', ''), 'revision_count': final_state.get('revision_count', 0), 'crew_name': crew.name})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'ワークフローが結果を返しませんでした'})}\n\n"
+
+        except Exception as e:
+            logger.error(f"[LangGraph Director Stream] Error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+
+# ============================================================
+# プロジェクト実行 v2 (LangGraph + 自己修正ループ)
+# ============================================================
+
+@app.post("/api/director/execute-stream-v2")
+async def execute_project_stream_v2(
+    project_title: str = Form(...),
+    description: str = Form(...),
+    user_goal: str = Form(...),
+    required_inputs_json: str = Form(...),
+    tasks_json: str = Form(...),
+    input_values_json: str = Form(...),
+    files: Optional[list[UploadFile]] = File(None),
+    google_access_token: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    プロジェクト実行 v2（Generatorのみ = シンプル高速版）
+
+    各タスクでクルーが1回だけ成果物を作成:
+    - Reflectorを使わないためAPIコール数を大幅削減
+    - タスク数を2-3に抑えることでさらに高速化
+
+    SSEで進捗をリアルタイム通知:
+    - start: プロジェクト開始
+    - task_start: タスク開始
+    - generation_complete: クルーが成果物作成完了
+    - task_complete: タスク完了
+    - complete: プロジェクト全体完了
+    - error: エラー発生
+    """
+    from services.pdf_reader import extract_text_from_pdf
+    from services.web_reader import fetch_web_content
+    from graphs import run_generator_only_stream
+    from starlette.responses import StreamingResponse
+    import io
+
+    async def generate():
+        try:
+            # JSONをパース
+            required_inputs = json.loads(required_inputs_json)
+            tasks = json.loads(tasks_json)
+            input_values = json.loads(input_values_json)
+
+            logger.info(f"[Director v2] Starting project: {project_title} with {len(tasks)} tasks")
+
+            # ファイルをキーでマッピング
+            file_map: dict[str, UploadFile] = {}
+            if files is None:
+                files_list = []
+            else:
+                files_list = files
+            for f in files_list:
+                if f.filename and ":::" in f.filename:
+                    key = f.filename.split(":::")[0]
+                    file_map[key] = f
+
+            # 1. 入力データを処理してコンテキスト構築
+            context: dict[str, str] = {}
+            for input_def in required_inputs:
+                key = input_def["key"]
+                label = input_def["label"]
+                input_type = input_def["type"]
+
+                try:
+                    if input_type == "file":
+                        if key in file_map:
+                            file = file_map[key]
+                            content = await file.read()
+                            text = extract_text_from_pdf(io.BytesIO(content))
+                            context[key] = text
+                        else:
+                            context[key] = f"（{label}のファイルが提供されていません）"
+
+                    elif input_type == "url":
+                        url = input_values.get(key, "")
+                        if url:
+                            text = await fetch_web_content(url)
+                            context[key] = text
+                        else:
+                            context[key] = f"（{label}のURLが入力されていません）"
+
+                    elif input_type == "text":
+                        context[key] = input_values.get(key, "")
+
+                except Exception as e:
+                    logger.error(f"[Director v2] Error processing input '{key}': {e}")
+                    context[key] = f"（{label}の読み込みに失敗しました: {str(e)}）"
+
+            # 開始イベント
+            yield f"data: {json.dumps({'type': 'start', 'total_tasks': len(tasks), 'project_title': project_title})}\n\n"
+
+            # 2. タスクを順次実行（LangGraphで自己修正ループ）
+            task_results = []
+            previous_output = ""
+            import asyncio
+
+            for idx, task in enumerate(tasks):
+                # タスク間に遅延を入れてレート制限を回避（2タスク目以降）
+                if idx > 0:
+                    logger.info(f"[Director v2] Waiting 15 seconds before task {idx + 1}...")
+                    await asyncio.sleep(15)  # 15秒待機（レート制限回避）
+                role = task["role"]
+                crew_id = task["assigned_crew_id"]
+                crew_name = task["assigned_crew_name"]
+                crew_image = task["assigned_crew_image"]
+                instruction = task["instruction"]
+
+                # クルー情報を取得
+                crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+                personality = crew.personality if crew else ""
+
+                # 変数置換
+                processed_instruction = instruction
+                for key, value in context.items():
+                    processed_instruction = processed_instruction.replace(f"{{{key}}}", value)
+
+                # 前のタスクの成果物を追加
+                if previous_output:
+                    full_task = f"""## あなたのタスク
+{processed_instruction}
+
+## 前のタスクの成果物
+{previous_output}
+
+上記の指示に従って、タスクを実行してください。"""
+                else:
+                    full_task = f"""## あなたのタスク
+{processed_instruction}
+
+上記の指示に従って、タスクを実行してください。"""
+
+                # タスク開始イベント
+                yield f"data: {json.dumps({'type': 'task_start', 'task_index': idx, 'role': role, 'crew_name': crew_name, 'crew_image': crew_image, 'total_tasks': len(tasks)})}\n\n"
+
+                try:
+                    # Generatorのみを実行（Reflectorなし = APIコール削減）
+                    final_result = ""
+                    final_score = 0
+                    final_critique = ""
+                    revision_count = 0
+
+                    async for event in run_generator_only_stream(
+                        task=full_task,
+                        crew_name=crew_name,
+                        crew_personality=personality,
+                        crew_image=crew_image,
+                    ):
+                        event_type = event.get("type", "")
+
+                        # イベントをフロントエンドに転送
+                        if event_type in ["generation_complete", "reflection_complete", "revision_start"]:
+                            # タスクインデックスを追加
+                            event["task_index"] = idx
+                            yield f"data: {json.dumps(event)}\n\n"
+
+                        elif event_type == "workflow_complete":
+                            final_result = event.get("final_result", "")
+                            final_score = event.get("score", 0)
+                            final_critique = event.get("critique", "")
+                            revision_count = event.get("revision_count", 0)
+
+                        elif event_type == "workflow_error":
+                            raise Exception(event.get("error", "Unknown error"))
+
+                    # タスク完了イベント
+                    task_result = {
+                        "task_index": idx,
+                        "role": role,
+                        "crew_name": crew_name,
+                        "crew_image": crew_image,
+                        "instruction": instruction,
+                        "result": final_result,
+                        "score": final_score,
+                        "critique": final_critique,
+                        "revision_count": revision_count,
+                        "status": "completed",
+                    }
+                    task_results.append(task_result)
+
+                    yield f"data: {json.dumps({'type': 'task_complete', 'task_result': task_result})}\n\n"
+
+                    # 次のタスクへの引き継ぎ
+                    previous_output = final_result
+
+                    # クルーのEXP加算（スコアに応じてボーナス）
+                    if crew:
+                        base_exp = 15
+                        score_bonus = max(0, (final_score - 60) // 10) * 5  # 70点で+5, 80点で+10, 90点で+15
+                        total_exp = base_exp + score_bonus
+
+                        old_level = crew.level
+                        crew.exp += total_exp
+
+                        # レベルアップチェック
+                        while crew.exp >= crew.level * 100:
+                            crew.exp -= crew.level * 100
+                            crew.level += 1
+
+                        db.commit()
+                        logger.info(f"[Director v2] Added {total_exp} EXP to {crew_name} (score bonus: {score_bonus}). Level: {old_level} -> {crew.level}")
+
+                    logger.info(f"[Director v2] Task {idx + 1} completed: {role} by {crew_name}, score={final_score}, revisions={revision_count}")
+
+                except Exception as e:
+                    logger.error(f"[Director v2] Error executing task {idx + 1}: {e}")
+                    task_result = {
+                        "task_index": idx,
+                        "role": role,
+                        "crew_name": crew_name,
+                        "crew_image": crew_image,
+                        "instruction": instruction,
+                        "result": f"エラーが発生しました: {str(e)}",
+                        "score": 0,
+                        "revision_count": 0,
+                        "status": "error",
+                    }
+                    task_results.append(task_result)
+                    yield f"data: {json.dumps({'type': 'task_complete', 'task_result': task_result})}\n\n"
+
+            # 完了イベント
+            yield f"data: {json.dumps({'type': 'complete', 'project_title': project_title, 'total_tasks': len(tasks)})}\n\n"
+            logger.info(f"[Director v2] Project execution completed: {project_title}")
+
+        except Exception as e:
+            logger.error(f"[Director v2] Project error: {e}")
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
     return StreamingResponse(
