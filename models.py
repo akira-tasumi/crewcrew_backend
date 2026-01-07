@@ -279,3 +279,129 @@ class SavedProject(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=now_jst, onupdate=now_jst, nullable=False
     )
+
+
+class Notification(Base):
+    """ユーザーへの通知"""
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    notification_type: Mapped[str] = mapped_column(String(50), default="info")  # success, error, info, warning
+    link: Mapped[str | None] = mapped_column(String(500), nullable=True)  # 遷移先URL
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, nullable=False
+    )
+
+
+class ActivityLog(Base):
+    """システムアクティビティログ（バックグラウンドタスクの履歴等）"""
+    __tablename__ = "activity_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    project_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("projects.id"), nullable=True)
+    level: Mapped[str] = mapped_column(String(20), default="INFO")  # INFO, ERROR, WARNING, DEBUG
+    action: Mapped[str] = mapped_column(String(100), nullable=False)  # project_started, project_completed, etc.
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON形式の追加情報
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, nullable=False
+    )
+
+
+class ExecutionStatus:
+    """
+    BackgroundExecutionの状態定数
+
+    状態遷移:
+    - pending → running → completed/failed
+    - pending/running → cancelling → cancelled
+    """
+    PENDING = "pending"          # 実行待ち
+    RUNNING = "running"          # 実行中
+    CANCELLING = "cancelling"    # キャンセル処理中（ユーザー要求済み、プロセス停止待ち）
+    CANCELLED = "cancelled"      # キャンセル完了
+    COMPLETED = "completed"      # 正常終了
+    FAILED = "failed"            # エラー終了
+
+    # キャンセル可能な状態
+    CANCELLABLE = [PENDING, RUNNING]
+
+    # 終了状態（これ以上変化しない）
+    TERMINAL = [COMPLETED, FAILED, CANCELLED]
+
+
+class BackgroundExecution(Base):
+    """バックグラウンド実行の状態管理"""
+    __tablename__ = "background_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    execution_type: Mapped[str] = mapped_column(String(50), nullable=False)  # task, project
+
+    # タスク依頼の場合
+    crew_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("crews.id"), nullable=True)
+    task_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # プロジェクトの場合
+    project_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("projects.id"), nullable=True)
+    project_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    project_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: tasks, inputs等
+
+    # 共通
+    status: Mapped[str] = mapped_column(String(50), default=ExecutionStatus.PENDING)  # ExecutionStatus参照
+    current_step: Mapped[int] = mapped_column(Integer, default=0)  # 現在のステップ（タスク番号）
+    total_steps: Mapped[int] = mapped_column(Integer, default=1)  # 総ステップ数
+    progress_message: Mapped[str | None] = mapped_column(String(500), nullable=True)  # 進捗メッセージ
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)  # 最終結果（JSON）
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ApprovalRequest(Base):
+    """
+    Human-in-the-loop: 承認待ちリクエストを管理
+
+    AIが生成した成果物を外部送信・保存する前に、
+    人間がレビュー・修正・承認できるようにするためのテーブル。
+    """
+    __tablename__ = "approval_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    execution_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("background_executions.id"), nullable=True)
+
+    # LangGraph再開用
+    thread_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    checkpoint_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # シリアライズされたチェックポイント
+
+    # 承認対象の情報
+    output_type: Mapped[str] = mapped_column(String(50), nullable=False)  # slides / sheets / slack / email
+    pending_output: Mapped[str] = mapped_column(Text, nullable=False)  # 承認待ちの成果物（テキスト or JSON）
+    preview_data: Mapped[str | None] = mapped_column(Text, nullable=True)  # プレビュー用データ（スライド構造等）
+
+    # メタデータ
+    crew_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    crew_image: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    task_summary: Mapped[str] = mapped_column(String(500), nullable=False)  # タスクの要約
+
+    # ステータス管理
+    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending / approved / rejected / modified
+    human_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)  # 修正指示やコメント
+    modified_output: Mapped[str | None] = mapped_column(Text, nullable=True)  # 修正後の成果物
+
+    # タイムスタンプ
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_jst, nullable=False
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # 承認期限（オプション）

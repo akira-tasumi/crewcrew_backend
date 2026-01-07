@@ -8,13 +8,13 @@ from typing import Optional
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, File, Form, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine, get_db
-from models import Crew as CrewModel, TaskLog, User as UserModel, UnlockedPersonality, DailyLog, Gadget, CrewGadget, Skill, CrewSkill, Project, ProjectTask, ProjectInput, UserGadget
+from models import Crew as CrewModel, TaskLog, User as UserModel, UnlockedPersonality, DailyLog, Gadget, CrewGadget, Skill, CrewSkill, Project, ProjectTask, ProjectInput, UserGadget, Notification, ActivityLog, BackgroundExecution, ApprovalRequest
 from seed import seed_crews, seed_gadgets, seed_skills, seed_users, ROLES, PERSONALITIES
 from services.bedrock_service import execute_task_with_crew, execute_task_with_crew_and_images, generate_greeting, route_task_with_partner, generate_whimsical_talk, generate_labor_words
 from graphs import run_director_workflow
@@ -31,6 +31,9 @@ from routers import shop as shop_router
 from routers import auth as auth_router
 from routers import saved_projects as saved_projects_router
 from routers import research as research_router
+from routers import notifications as notifications_router
+from routers import background as background_router
+from routers import approval as approval_router
 import re
 
 load_dotenv()
@@ -229,6 +232,33 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    # 起動時: 実行中/キャンセル処理中だったタスクをキャンセル済みに更新
+    logger.info("Cleaning up stale running executions...")
+    db = SessionLocal()
+    try:
+        from models import now_jst, ExecutionStatus
+        stale_executions = db.query(BackgroundExecution).filter(
+            BackgroundExecution.status.in_([
+                ExecutionStatus.PENDING,
+                ExecutionStatus.RUNNING,
+                ExecutionStatus.CANCELLING  # キャンセル処理中も含める
+            ])
+        ).all()
+
+        for execution in stale_executions:
+            execution.status = ExecutionStatus.CANCELLED
+            execution.progress_message = "サーバー再起動によりキャンセルされました"
+            execution.completed_at = now_jst()
+            logger.info(f"Cancelled stale execution: {execution.id}")
+
+        if stale_executions:
+            db.commit()
+            logger.info(f"Cancelled {len(stale_executions)} stale executions")
+    except Exception as e:
+        logger.error(f"Error cleaning up stale executions: {e}")
+    finally:
+        db.close()
+
     logger.info("Kurukuru Backend server started successfully!")
     yield
 
@@ -251,6 +281,9 @@ app.include_router(shop_router.router)
 app.include_router(auth_router.router)
 app.include_router(saved_projects_router.router)
 app.include_router(research_router.router)
+app.include_router(notifications_router.router)
+app.include_router(background_router.router)
+app.include_router(approval_router.router)
 
 
 # --- Response Models ---
@@ -976,6 +1009,12 @@ async def execute_task(
     - crew_id: タスクを実行するクルーのID
     - task: 実行するタスクの内容
     """
+    from services import notification_service
+    from services.notification_service import LogAction, LogLevel
+
+    # user_id（シングルユーザーモード）
+    user_id = 1
+
     # クルーをDBから取得
     crew = db.query(CrewModel).filter(CrewModel.id == request.crew_id).first()
     if not crew:
@@ -1195,6 +1234,53 @@ async def execute_task(
                 logger.warning("Could not parse table data from AI output")
         except Exception as e:
             logger.error(f"Failed to create Google Sheets: {e}")
+
+    # アクティビティログと通知を記録
+    if result["success"]:
+        notification_service.write_log(
+            db=db,
+            user_id=user_id,
+            action=LogAction.TASK_COMPLETED,
+            message=f"タスク完了: {crew.name}",
+            level=LogLevel.INFO,
+            details={
+                "task": request.task[:100],
+                "crew_name": crew.name,
+                "exp_gained": exp_gained,
+                "searched": result.get("searched", False),
+            },
+        )
+        # 通知を作成
+        notification_service.create_notification(
+            db=db,
+            user_id=user_id,
+            title="タスク完了",
+            message=f"{crew.name}がタスクを完了しました（+{exp_gained}EXP）",
+            notification_type="success",
+            link="/log",
+        )
+    else:
+        notification_service.write_log(
+            db=db,
+            user_id=user_id,
+            action=LogAction.TASK_FAILED,
+            message=f"タスク失敗: {crew.name} - {result.get('error', 'Unknown error')}",
+            level=LogLevel.ERROR,
+            details={
+                "task": request.task[:100],
+                "crew_name": crew.name,
+                "error": result.get("error"),
+            },
+        )
+        # エラー通知を作成
+        notification_service.create_notification(
+            db=db,
+            user_id=user_id,
+            title="タスク失敗",
+            message=f"{crew.name}のタスク実行に失敗しました",
+            notification_type="error",
+            link="/log",
+        )
 
     return ExecuteTaskResponse(
         success=result["success"],
@@ -3270,6 +3356,7 @@ class DirectorPlanResponse(BaseModel):
     partner_name: str | None = None
     partner_image: str | None = None
     error: str | None = None
+    search_context: str | None = None  # Deep Researchの検索結果
 
 
 @app.post("/api/director/plan")
@@ -3282,12 +3369,15 @@ async def create_project_plan(
 
     - 相棒がPMとして、最適なクルー編成とタスクリストを作成
     - 必要な入力情報（ファイル/URL等）を特定
+    - 最新情報が必要な場合は自動でDeep Researchを実行
     """
     import boto3
     import json
     import re
 
     try:
+        # 検索はタスク実行時に行うため、プラン作成時はスキップ（高速化）
+
         # 1. 相棒を取得
         partner = db.query(CrewModel).filter(CrewModel.is_partner == True).first()
         if not partner:
@@ -3457,6 +3547,7 @@ async def create_project_plan(
             tasks=tasks_with_crew,
             partner_name=partner.name,
             partner_image=partner.image_url,
+            search_context=None,  # 検索はタスク実行時に行う
         )
 
     except json.JSONDecodeError as e:
@@ -4456,6 +4547,8 @@ async def execute_project_stream_v2(
     input_values_json: str = Form(...),
     files: Optional[list[UploadFile]] = File(None),
     google_access_token: Optional[str] = Form(None),
+    search_context: Optional[str] = Form(None),  # Deep Researchの検索結果
+    require_approval: Optional[str] = Form("false"),  # 承認モード（"true"/"false"）
     db: Session = Depends(get_db),
 ):
     """
@@ -4477,9 +4570,17 @@ async def execute_project_stream_v2(
     from services.web_reader import fetch_web_content
     from graphs import run_generator_only_stream
     from starlette.responses import StreamingResponse
+    from services import notification_service
+    from services.notification_service import LogAction, LogLevel, NotificationType
     import io
 
+    # user_id（シングルユーザーモード）
+    user_id = 1
+
     async def generate():
+        # 通知用にタスク結果を収集
+        completed_task_results = []
+
         try:
             # JSONをパース
             required_inputs = json.loads(required_inputs_json)
@@ -4542,8 +4643,8 @@ async def execute_project_stream_v2(
             for idx, task in enumerate(tasks):
                 # タスク間に遅延を入れてレート制限を回避（2タスク目以降）
                 if idx > 0:
-                    logger.info(f"[Director v2] Waiting 15 seconds before task {idx + 1}...")
-                    await asyncio.sleep(15)  # 15秒待機（レート制限回避）
+                    logger.info(f"[Director v2] Waiting 45 seconds before task {idx + 1}...")
+                    await asyncio.sleep(45)  # 45秒待機（レート制限回避）
                 role = task["role"]
                 crew_id = task["assigned_crew_id"]
                 crew_name = task["assigned_crew_name"]
@@ -4569,8 +4670,11 @@ async def execute_project_stream_v2(
 
 上記の指示に従って、タスクを実行してください。"""
                 else:
+                    # 最初のタスクには検索コンテキストを追加
+                    search_info = search_context if search_context and idx == 0 else ""
                     full_task = f"""## あなたのタスク
 {processed_instruction}
+{search_info}
 
 上記の指示に従って、タスクを実行してください。"""
 
@@ -4607,6 +4711,92 @@ async def execute_project_stream_v2(
                         elif event_type == "workflow_error":
                             raise Exception(event.get("error", "Unknown error"))
 
+                    # スライド/シート生成処理
+                    slide_url = None
+                    slide_id = None
+                    sheet_url = None
+                    sheet_id = None
+                    awaiting_approval = False
+
+                    # スライドタスク判定
+                    slide_keywords = ["スライド", "プレゼン", "発表資料", "slide", "presentation", "ppt"]
+                    is_slide_task = any(keyword in instruction.lower() for keyword in slide_keywords)
+
+                    # シートタスク判定
+                    sheet_keywords = ["表", "テーブル", "一覧", "リスト", "スプレッドシート", "sheet", "table", "csv"]
+                    is_sheet_task = any(keyword in instruction.lower() for keyword in sheet_keywords)
+
+                    # 承認モードの判定
+                    is_approval_mode = require_approval == "true"
+                    needs_external_output = (is_slide_task or is_sheet_task) and google_access_token
+
+                    # 承認モードON + 外部出力が必要な場合は承認リクエストを作成
+                    if is_approval_mode and needs_external_output and final_result:
+                        output_type = "slides" if is_slide_task else "sheets"
+                        # 承認リクエストをDBに保存
+                        approval_request = ApprovalRequest(
+                            user_id=user_id,
+                            thread_id=f"director-v2-{project_title}-{idx}-{crew_id}",
+                            output_type=output_type,
+                            pending_output=final_result,
+                            crew_name=crew_name,
+                            crew_image=crew_image,
+                            task_summary=instruction[:500],
+                            status="pending",
+                        )
+                        db.add(approval_request)
+                        db.commit()
+                        db.refresh(approval_request)
+
+                        logger.info(f"[Director v2] Approval request created: id={approval_request.id}, output_type={output_type}")
+                        awaiting_approval = True
+
+                        # 承認待ちイベントを送信
+                        yield f"data: {json.dumps({'type': 'awaiting_approval', 'task_index': idx, 'approval_id': approval_request.id, 'output_type': output_type, 'crew_name': crew_name, 'crew_image': crew_image})}\n\n"
+
+                    # スライド生成（スライドタスク + Google認証済み + 承認待ちでない場合）
+                    if is_slide_task and google_access_token and final_result and not awaiting_approval:
+                        try:
+                            logger.info(f"[Director v2] Attempting to create Google Slides for task {idx + 1}...")
+                            pages = _parse_slides_from_ai_output(final_result)
+                            if pages:
+                                title = _extract_slide_title(instruction, final_result)
+                                slide_result = create_presentation(
+                                    access_token=google_access_token,
+                                    title=title,
+                                    pages=pages
+                                )
+                                slide_url = slide_result["presentationUrl"]
+                                slide_id = slide_result["presentationId"]
+                                logger.info(f"[Director v2] Google Slides created: {slide_url}")
+                                # 結果にスライドURLを追加
+                                final_result = f"{final_result}\n\n📊 **Googleスライドを作成しました！**\n{slide_url}"
+                            else:
+                                logger.warning("[Director v2] Could not parse slides from AI output")
+                        except Exception as slide_error:
+                            logger.error(f"[Director v2] Failed to create Google Slides: {slide_error}")
+
+                    # シート生成（シートタスク + Google認証済み + スライドタスクではない + 承認待ちでない場合）
+                    if is_sheet_task and not is_slide_task and google_access_token and final_result and not awaiting_approval:
+                        try:
+                            logger.info(f"[Director v2] Attempting to create Google Sheets for task {idx + 1}...")
+                            table_data = parse_table_from_text(final_result)
+                            if table_data:
+                                title = extract_sheet_title(instruction, final_result)
+                                sheet_result = create_spreadsheet(
+                                    access_token=google_access_token,
+                                    title=title,
+                                    data=table_data
+                                )
+                                sheet_url = sheet_result["spreadsheetUrl"]
+                                sheet_id = sheet_result["spreadsheetId"]
+                                logger.info(f"[Director v2] Google Sheets created: {sheet_url}")
+                                final_result = f"{final_result}\n\n📋 **Googleスプレッドシートを作成しました！**\n{sheet_url}"
+                            else:
+                                logger.warning("[Director v2] Could not parse table data from AI output")
+                        except Exception as sheet_error:
+                            logger.error(f"[Director v2] Failed to create Google Sheets: {sheet_error}")
+
                     # タスク完了イベント
                     task_result = {
                         "task_index": idx,
@@ -4618,23 +4808,24 @@ async def execute_project_stream_v2(
                         "score": final_score,
                         "critique": final_critique,
                         "revision_count": revision_count,
-                        "status": "completed",
+                        "status": "awaiting_approval" if awaiting_approval else "completed",
+                        "slide_url": slide_url,
+                        "slide_id": slide_id,
+                        "sheet_url": sheet_url,
+                        "sheet_id": sheet_id,
+                        "awaiting_approval": awaiting_approval,
                     }
                     task_results.append(task_result)
 
-                    yield f"data: {json.dumps({'type': 'task_complete', 'task_result': task_result})}\n\n"
-
-                    # 次のタスクへの引き継ぎ
-                    previous_output = final_result
-
                     # クルーのEXP加算（スコアに応じてボーナス）
+                    exp_gained = 0
                     if crew:
                         base_exp = 15
                         score_bonus = max(0, (final_score - 60) // 10) * 5  # 70点で+5, 80点で+10, 90点で+15
-                        total_exp = base_exp + score_bonus
+                        exp_gained = base_exp + score_bonus
 
                         old_level = crew.level
-                        crew.exp += total_exp
+                        crew.exp += exp_gained
 
                         # レベルアップチェック
                         while crew.exp >= crew.level * 100:
@@ -4642,7 +4833,22 @@ async def execute_project_stream_v2(
                             crew.level += 1
 
                         db.commit()
-                        logger.info(f"[Director v2] Added {total_exp} EXP to {crew_name} (score bonus: {score_bonus}). Level: {old_level} -> {crew.level}")
+                        logger.info(f"[Director v2] Added {exp_gained} EXP to {crew_name} (score bonus: {score_bonus}). Level: {old_level} -> {crew.level}")
+
+                    completed_task_results.append({
+                        "role": role,
+                        "crew_name": crew_name,
+                        "crew_image": crew_image,
+                        "instruction": instruction,
+                        "result": final_result,
+                        "score": final_score,
+                        "exp_gained": exp_gained,
+                    })
+
+                    yield f"data: {json.dumps({'type': 'task_complete', 'task_result': task_result})}\n\n"
+
+                    # 次のタスクへの引き継ぎ
+                    previous_output = final_result
 
                     logger.info(f"[Director v2] Task {idx + 1} completed: {role} by {crew_name}, score={final_score}, revisions={revision_count}")
 
@@ -4662,12 +4868,45 @@ async def execute_project_stream_v2(
                     task_results.append(task_result)
                     yield f"data: {json.dumps({'type': 'task_complete', 'task_result': task_result})}\n\n"
 
+                    # タスク失敗ログ
+                    notification_service.write_log(
+                        db=db,
+                        user_id=user_id,
+                        action=LogAction.TASK_FAILED,
+                        message=f"タスク失敗: {role} ({crew_name}) - {str(e)}",
+                        level=LogLevel.ERROR,
+                    )
+
+            # プロジェクト完了通知を作成
+            result_summary = "\n".join([f"・{r['role']}: {r['crew_name']} (スコア: {r['score']})" for r in completed_task_results])
+            notification_service.notify_project_completed(
+                db=db,
+                user_id=user_id,
+                project_id=None,
+                project_title=project_title,
+                result_summary=result_summary,
+                task_results=completed_task_results,
+            )
+
             # 完了イベント
             yield f"data: {json.dumps({'type': 'complete', 'project_title': project_title, 'total_tasks': len(tasks)})}\n\n"
             logger.info(f"[Director v2] Project execution completed: {project_title}")
 
         except Exception as e:
             logger.error(f"[Director v2] Project error: {e}")
+
+            # プロジェクト失敗通知
+            try:
+                notification_service.notify_project_failed(
+                    db=db,
+                    user_id=user_id,
+                    project_id=None,
+                    project_title=project_title,
+                    error_message=str(e),
+                )
+            except Exception as notify_err:
+                logger.error(f"[Director v2] Failed to create error notification: {notify_err}")
+
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
     return StreamingResponse(
@@ -4678,3 +4917,259 @@ async def execute_project_stream_v2(
             "Connection": "keep-alive",
         }
     )
+
+
+# ============================================================
+# プロジェクト実行 v3 (バックグラウンド実行版)
+# ============================================================
+
+class BackgroundExecuteRequest(BaseModel):
+    """バックグラウンド実行リクエスト"""
+    project_title: str
+    description: str
+    user_goal: str
+    required_inputs: list[dict]
+    tasks: list[dict]
+    input_values: dict[str, str]
+    google_access_token: Optional[str] = None
+
+
+class BackgroundExecuteResponse(BaseModel):
+    """バックグラウンド実行レスポンス"""
+    success: bool
+    message: str
+    project_id: Optional[int] = None
+
+
+@app.post("/api/director/execute-background", response_model=BackgroundExecuteResponse, status_code=202)
+async def execute_project_background(
+    request: BackgroundExecuteRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    プロジェクト実行 v3（バックグラウンド実行版）
+
+    即座に202 Acceptedを返し、バックグラウンドでプロジェクトを実行。
+    完了/エラー時に通知を作成。
+    """
+    from fastapi import BackgroundTasks
+    from services import notification_service
+    from services.notification_service import (
+        LogAction, LogLevel, NotificationType,
+        notify_project_started, notify_project_completed, notify_project_failed
+    )
+
+    # プロジェクトをDBに保存（オプション）
+    # ここでは簡易的にuser_id=1を使用
+    user_id = 1
+
+    # バックグラウンドタスクを登録
+    background_tasks.add_task(
+        _run_project_background,
+        project_title=request.project_title,
+        description=request.description,
+        user_goal=request.user_goal,
+        required_inputs=request.required_inputs,
+        tasks=request.tasks,
+        input_values=request.input_values,
+        google_access_token=request.google_access_token,
+        user_id=user_id,
+    )
+
+    return BackgroundExecuteResponse(
+        success=True,
+        message="バックグラウンドで実行を開始しました",
+    )
+
+
+async def _run_project_background(
+    project_title: str,
+    description: str,
+    user_goal: str,
+    required_inputs: list[dict],
+    tasks: list[dict],
+    input_values: dict[str, str],
+    google_access_token: Optional[str],
+    user_id: int,
+):
+    """
+    バックグラウンドでプロジェクトを実行する内部関数
+    """
+    from services.pdf_reader import extract_text_from_pdf
+    from services.web_reader import fetch_web_content
+    from graphs import run_generator_only_stream
+    from services import notification_service
+    from services.notification_service import LogAction, LogLevel, NotificationType
+    import asyncio
+
+    # 新しいDBセッションを作成
+    db = SessionLocal()
+
+    try:
+        logger.info(f"[Background] Starting project: {project_title} with {len(tasks)} tasks")
+
+        # 入力データを処理してコンテキスト構築
+        context: dict[str, str] = {}
+        for input_def in required_inputs:
+            key = input_def["key"]
+            label = input_def["label"]
+            input_type = input_def["type"]
+
+            try:
+                if input_type == "url":
+                    url = input_values.get(key, "")
+                    if url:
+                        text = await fetch_web_content(url)
+                        context[key] = text
+                    else:
+                        context[key] = f"（{label}のURLが入力されていません）"
+
+                elif input_type == "text":
+                    context[key] = input_values.get(key, "")
+
+                elif input_type == "file":
+                    # バックグラウンドではファイルアップロードは事前処理が必要
+                    context[key] = input_values.get(key, f"（{label}のファイル内容）")
+
+            except Exception as e:
+                logger.error(f"[Background] Error processing input '{key}': {e}")
+                context[key] = f"（{label}の読み込みに失敗しました: {str(e)}）"
+
+        # タスクを順次実行
+        task_results = []
+        previous_output = ""
+
+        for idx, task in enumerate(tasks):
+            # タスク間に遅延を入れてレート制限を回避
+            if idx > 0:
+                logger.info(f"[Background] Waiting 45 seconds before task {idx + 1}...")
+                await asyncio.sleep(45)
+
+            role = task["role"]
+            crew_id = task["assigned_crew_id"]
+            crew_name = task["assigned_crew_name"]
+            crew_image = task.get("assigned_crew_image", "")
+            instruction = task["instruction"]
+
+            # クルー情報を取得
+            crew = db.query(CrewModel).filter(CrewModel.id == crew_id).first()
+            personality = crew.personality if crew else ""
+
+            # 変数置換
+            processed_instruction = instruction
+            for key, value in context.items():
+                processed_instruction = processed_instruction.replace(f"{{{key}}}", value)
+
+            # 前のタスクの成果物を追加
+            if previous_output:
+                full_task = f"""## あなたのタスク
+{processed_instruction}
+
+## 前のタスクの成果物
+{previous_output}
+
+上記の指示に従って、タスクを実行してください。"""
+            else:
+                full_task = f"""## あなたのタスク
+{processed_instruction}
+
+上記の指示に従って、タスクを実行してください。"""
+
+            # タスク開始ログ
+            notification_service.write_log(
+                db=db,
+                user_id=user_id,
+                action=LogAction.TASK_STARTED,
+                message=f"タスク {idx + 1}/{len(tasks)}: {role} ({crew_name})",
+                level=LogLevel.INFO,
+            )
+
+            try:
+                final_result = ""
+                final_score = 0
+
+                async for event in run_generator_only_stream(
+                    task=full_task,
+                    crew_name=crew_name,
+                    crew_personality=personality,
+                    crew_image=crew_image,
+                ):
+                    event_type = event.get("type", "")
+
+                    if event_type == "workflow_complete":
+                        final_result = event.get("final_result", "")
+                        final_score = event.get("score", 0)
+
+                    elif event_type == "workflow_error":
+                        raise Exception(event.get("error", "Unknown error"))
+
+                # クルーのEXP加算
+                exp_gained = 0
+                if crew:
+                    base_exp = 15
+                    score_bonus = max(0, (final_score - 60) // 10) * 5
+                    exp_gained = base_exp + score_bonus
+                    crew.exp += exp_gained
+                    while crew.exp >= crew.level * 100:
+                        crew.exp -= crew.level * 100
+                        crew.level += 1
+                    db.commit()
+
+                task_results.append({
+                    "role": role,
+                    "crew_name": crew_name,
+                    "crew_image": crew_image,
+                    "instruction": instruction,
+                    "result": final_result,
+                    "score": final_score,
+                    "exp_gained": exp_gained,
+                })
+
+                previous_output = final_result
+
+                logger.info(f"[Background] Task {idx + 1} completed: {role} by {crew_name}, score={final_score}")
+
+            except Exception as e:
+                logger.error(f"[Background] Error executing task {idx + 1}: {e}")
+                notification_service.write_log(
+                    db=db,
+                    user_id=user_id,
+                    action=LogAction.TASK_FAILED,
+                    message=f"タスク失敗: {role} - {str(e)}",
+                    level=LogLevel.ERROR,
+                )
+                task_results.append({
+                    "role": role,
+                    "crew_name": crew_name,
+                    "crew_image": crew_image,
+                    "instruction": instruction,
+                    "result": f"エラー: {str(e)}",
+                    "score": 0,
+                })
+
+        # プロジェクト完了通知
+        result_summary = "\n".join([f"・{r['role']}: {r['crew_name']} (スコア: {r['score']})" for r in task_results])
+        notification_service.notify_project_completed(
+            db=db,
+            user_id=user_id,
+            project_id=None,  # プロジェクトIDがある場合は設定
+            project_title=project_title,
+            result_summary=result_summary,
+            task_results=task_results,
+        )
+
+        logger.info(f"[Background] Project completed: {project_title}")
+
+    except Exception as e:
+        logger.error(f"[Background] Project error: {e}")
+        notification_service.notify_project_failed(
+            db=db,
+            user_id=user_id,
+            project_id=None,
+            project_title=project_title,
+            error_message=str(e),
+        )
+
+    finally:
+        db.close()

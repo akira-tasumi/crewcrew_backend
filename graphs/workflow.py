@@ -3,17 +3,26 @@
 
 LangGraphを使用して自己修正ループを構築
 - generator -> reflector -> (条件分岐) -> generator or END
+
+Human-in-the-loop機能:
+- 外部出力前にhuman_review_nodeでinterrupt
+- 承認後にoutput_creation_nodeで出力作成
 """
 
 import logging
+import json
 from typing import Dict, Any, Optional
 
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
-from .state import DirectorState, create_initial_state
-from .nodes import generator_node, reflector_node
+from .state import DirectorState, create_initial_state, OutputType
+from .nodes import generator_node, reflector_node, human_review_node, output_creation_node
 
 logger = logging.getLogger(__name__)
+
+# インメモリチェックポインター（本番環境ではSqliteなどに置き換え可能）
+checkpointer = MemorySaver()
 
 
 def should_continue(state: DirectorState) -> str:
@@ -47,6 +56,51 @@ def should_continue(state: DirectorState) -> str:
     return "generator"
 
 
+def should_go_to_review(state: DirectorState) -> str:
+    """
+    条件分岐: レビューノードに進むか終了するかを判定
+
+    Args:
+        state: 現在の状態
+
+    Returns:
+        "human_review" (承認フロー) または "end" (終了)
+    """
+    # 承認フローが有効で、外部出力が必要な場合
+    if state.get("requires_approval", False) and state.get("output_type", "none") != "none":
+        logger.info(f"[Workflow] Going to human review. output_type={state.get('output_type')}")
+        return "human_review"
+
+    logger.info("[Workflow] No approval required, ending workflow")
+    return "end"
+
+
+def should_create_output(state: DirectorState) -> str:
+    """
+    条件分岐: 出力作成に進むか終了するかを判定
+
+    Args:
+        state: 現在の状態
+
+    Returns:
+        "output_creation" (出力作成) または "end" (終了)
+    """
+    approval_status = state.get("approval_status", "none")
+
+    if approval_status == "approved":
+        logger.info("[Workflow] Approved, proceeding to output creation")
+        return "output_creation"
+    elif approval_status == "rejected":
+        logger.info("[Workflow] Rejected, ending workflow")
+        return "end"
+    elif approval_status == "pending":
+        # 承認待ち状態では中断される（interruptで停止）
+        logger.info("[Workflow] Pending approval, workflow will be interrupted")
+        return "end"  # interruptで停止するので実際には到達しない
+
+    return "end"
+
+
 def build_director_graph() -> StateGraph:
     """
     ディレクターモードのグラフを構築
@@ -54,7 +108,9 @@ def build_director_graph() -> StateGraph:
     フロー:
     START -> generator -> reflector -> (条件分岐)
                                         ├─> generator (ループ)
-                                        └─> END
+                                        └─> human_review -> (条件分岐)
+                                                             ├─> output_creation -> END
+                                                             └─> END
 
     Returns:
         コンパイル済みのStateGraph
@@ -65,26 +121,62 @@ def build_director_graph() -> StateGraph:
     # ノードを追加
     workflow.add_node("generator", generator_node)
     workflow.add_node("reflector", reflector_node)
+    workflow.add_node("human_review", human_review_node)
+    workflow.add_node("output_creation", output_creation_node)
 
     # エッジを追加
     workflow.set_entry_point("generator")  # 開始点
     workflow.add_edge("generator", "reflector")  # generator -> reflector
 
-    # 条件分岐を追加
+    # 条件分岐を追加（reflector後）
     workflow.add_conditional_edges(
         "reflector",
         should_continue,
         {
             "generator": "generator",  # ループ
-            "end": END,  # 終了
+            "end": "human_review",  # 終了 → レビューへ（または直接END）
         }
     )
+
+    # human_review後の条件分岐
+    workflow.add_conditional_edges(
+        "human_review",
+        should_create_output,
+        {
+            "output_creation": "output_creation",
+            "end": END,
+        }
+    )
+
+    # output_creation後は終了
+    workflow.add_edge("output_creation", END)
 
     return workflow
 
 
-# コンパイル済みのグラフをエクスポート
+def build_director_graph_with_interrupt() -> StateGraph:
+    """
+    Human-in-the-loop用のグラフを構築（interrupt_before付き）
+
+    human_reviewノードの前でinterruptし、承認を待つ。
+
+    Returns:
+        コンパイル済みのStateGraph（checkpointer付き）
+    """
+    workflow = build_director_graph()
+
+    # human_reviewノードの前でinterrupt
+    return workflow.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_review"]
+    )
+
+
+# コンパイル済みのグラフをエクスポート（従来互換）
 app = build_director_graph().compile()
+
+# Human-in-the-loop用グラフ
+app_with_approval = build_director_graph_with_interrupt()
 
 
 async def run_director_workflow(
@@ -429,3 +521,234 @@ async def run_generator_only_stream(
             "crew_name": crew_name,
             "message": f"エラーが発生しました: {str(e)}",
         }
+
+
+# =============================================================================
+# Human-in-the-loop ワークフロー関数
+# =============================================================================
+
+async def run_workflow_with_approval(
+    task: str,
+    crew_name: str,
+    crew_personality: str,
+    crew_image: str = "",
+    output_type: OutputType = "slides",
+    max_revisions: int = 3,
+) -> Dict[str, Any]:
+    """
+    承認フロー付きでワークフローを実行
+
+    human_reviewノードの前でinterruptし、承認待ち状態を返す。
+    フロントエンドは返されたthread_idを使って承認/却下/修正を送信する。
+
+    Args:
+        task: ユーザーからの指示
+        crew_name: 担当クルーの名前
+        crew_personality: クルーの性格設定
+        crew_image: クルーの画像URL
+        output_type: 出力タイプ（slides/sheets/slack/email）
+        max_revisions: 最大修正回数
+
+    Returns:
+        実行結果を含む辞書:
+        {
+            "success": bool,
+            "status": "awaiting_approval" | "completed" | "error",
+            "thread_id": str,  # 再開用
+            "pending_output": str,  # 承認待ちの成果物
+            "score": int,
+            "crew_name": str,
+            "error": str | None,
+        }
+    """
+    import uuid
+
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    logger.info(f"[ApprovalWorkflow] Starting: task={task[:50]}..., crew={crew_name}, thread_id={thread_id}")
+
+    try:
+        # 初期状態を作成
+        initial_state = create_initial_state(
+            task=task,
+            crew_name=crew_name,
+            crew_personality=crew_personality,
+            max_revisions=max_revisions,
+            requires_approval=True,
+            output_type=output_type,
+            thread_id=thread_id,
+        )
+
+        # グラフを実行（interruptで停止する）
+        final_state = None
+        async for state in app_with_approval.astream(initial_state, config):
+            for node_name, node_state in state.items():
+                logger.info(f"[ApprovalWorkflow] Node '{node_name}' completed")
+                # __interrupt__ ノードはタプルを返すのでスキップ
+                if node_name == "__interrupt__" or not isinstance(node_state, dict):
+                    continue
+                final_state = node_state
+
+        if final_state is None:
+            raise ValueError("Workflow produced no output")
+
+        # checkpointerから正確な状態を取得して、interruptされたかどうかを確認
+        checkpoint_state = app_with_approval.get_state(config)
+        is_interrupted = checkpoint_state.next and "human_review" in checkpoint_state.next
+
+        # 承認待ち状態かどうかを確認
+        approval_status = final_state.get("approval_status", "none")
+        is_complete = final_state.get("is_complete", False)
+
+        if is_interrupted or approval_status == "pending":
+            # 承認待ち状態で中断された
+            logger.info(f"[ApprovalWorkflow] Interrupted for approval. thread_id={thread_id}")
+            return {
+                "success": True,
+                "status": "awaiting_approval",
+                "thread_id": thread_id,
+                "pending_output": final_state.get("final_result") or final_state.get("draft", ""),
+                "score": final_state.get("score", 0),
+                "critique": final_state.get("critique", ""),
+                "revision_count": final_state.get("revision_count", 0),
+                "crew_name": crew_name,
+                "crew_image": crew_image,
+                "output_type": output_type,
+                "error": None,
+            }
+        else:
+            # 承認不要で完了した
+            logger.info(f"[ApprovalWorkflow] Completed without approval. thread_id={thread_id}")
+            return {
+                "success": True,
+                "status": "completed",
+                "thread_id": thread_id,
+                "final_result": final_state.get("final_result") or final_state.get("draft", ""),
+                "score": final_state.get("score", 0),
+                "critique": final_state.get("critique", ""),
+                "revision_count": final_state.get("revision_count", 0),
+                "crew_name": crew_name,
+                "crew_image": crew_image,
+                "output_type": output_type,
+                "error": None,
+            }
+
+    except Exception as e:
+        logger.error(f"[ApprovalWorkflow] Error: {e}")
+        return {
+            "success": False,
+            "status": "error",
+            "thread_id": thread_id,
+            "pending_output": None,
+            "score": 0,
+            "crew_name": crew_name,
+            "error": str(e),
+        }
+
+
+async def resume_workflow_with_approval(
+    thread_id: str,
+    approval_status: str,
+    human_feedback: Optional[str] = None,
+    modified_output: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    承認/却下/修正を受けてワークフローを再開
+
+    Args:
+        thread_id: 中断されたワークフローのスレッドID
+        approval_status: "approved" | "rejected" | "modified"
+        human_feedback: 修正指示やコメント（optional）
+        modified_output: 修正後の成果物（modifiedの場合）
+
+    Returns:
+        実行結果を含む辞書
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+
+    logger.info(f"[ResumeWorkflow] Resuming: thread_id={thread_id}, status={approval_status}")
+
+    try:
+        # 現在の状態を取得
+        current_state = app_with_approval.get_state(config)
+
+        if current_state is None or current_state.values is None:
+            raise ValueError(f"No checkpoint found for thread_id: {thread_id}")
+
+        # 状態を更新
+        update_values = {
+            "approval_status": approval_status,
+        }
+
+        if human_feedback:
+            update_values["human_feedback"] = human_feedback
+
+        if modified_output:
+            update_values["pending_output"] = modified_output
+
+        # 状態を更新してグラフを再開
+        app_with_approval.update_state(config, update_values)
+
+        # ワークフローを再開
+        final_state = None
+        async for state in app_with_approval.astream(None, config):
+            for node_name, node_state in state.items():
+                logger.info(f"[ResumeWorkflow] Node '{node_name}' completed")
+                # __interrupt__ ノードはタプルを返すのでスキップ
+                if node_name == "__interrupt__" or not isinstance(node_state, dict):
+                    continue
+                final_state = node_state
+
+        if final_state is None:
+            # 状態が更新されなかった場合は現在の状態を使用
+            final_state = current_state.values
+
+        is_complete = final_state.get("is_complete", False)
+        final_approval_status = final_state.get("approval_status", "none")
+
+        logger.info(f"[ResumeWorkflow] Completed: is_complete={is_complete}, status={final_approval_status}")
+
+        return {
+            "success": True,
+            "status": "completed" if is_complete else "awaiting_approval",
+            "thread_id": thread_id,
+            "final_result": final_state.get("final_result") or final_state.get("pending_output") or final_state.get("draft", ""),
+            "score": final_state.get("score", 0),
+            "approval_status": final_approval_status,
+            "output_type": final_state.get("output_type", "none"),
+            "error": None,
+        }
+
+    except Exception as e:
+        logger.error(f"[ResumeWorkflow] Error: {e}")
+        return {
+            "success": False,
+            "status": "error",
+            "thread_id": thread_id,
+            "final_result": None,
+            "error": str(e),
+        }
+
+
+def get_workflow_state(thread_id: str) -> Optional[Dict[str, Any]]:
+    """
+    ワークフローの現在の状態を取得
+
+    Args:
+        thread_id: ワークフローのスレッドID
+
+    Returns:
+        現在の状態を含む辞書、またはNone
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        state = app_with_approval.get_state(config)
+        if state is None or state.values is None:
+            return None
+
+        return dict(state.values)
+    except Exception as e:
+        logger.error(f"[GetState] Error: {e}")
+        return None

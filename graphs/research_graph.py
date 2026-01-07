@@ -21,9 +21,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# AWS設定
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+# AWS設定（クロスリージョン推論）
+AWS_REGION = "us-east-1"  # クロスリージョン推論はus-east-1から呼び出し
+MODEL_ID = "us.anthropic.claude-3-5-sonnet-20240620-v1:0"  # USクロスリージョン推論ID
 
 
 def get_tavily_api_key() -> str:
@@ -62,6 +62,122 @@ def create_initial_state(question: str) -> ResearchState:
 
 
 # =============================================================================
+# 検索必要性判断
+# =============================================================================
+
+def should_search(query: str) -> dict:
+    """
+    クエリに対して検索が必要かどうかを判断
+
+    Args:
+        query: ユーザーの質問・指示
+
+    Returns:
+        {
+            "needs_search": bool,
+            "reason": str,
+            "search_query": str (検索が必要な場合)
+        }
+    """
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    logger.info(f"[Search Judge] Evaluating: {query[:50]}...")
+
+    bedrock_config = BotoConfig(
+        read_timeout=60,
+        connect_timeout=10,
+        retries={'max_attempts': 2, 'mode': 'standard'},  # リトライを減らす
+    )
+    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=bedrock_config)
+
+    # 高速な軽量モデルを使用（検索判断のみなので）
+
+    system_prompt = """あなたは検索必要性を判断するAIです。
+ユーザーの質問・指示に対して、最新の情報や事実確認のためにWeb検索が必要かどうかを判断してください。
+
+【検索が必要な例】
+- 最新のニュース、トレンド、出来事に関する質問（「2024年の〜」「最新の〜」「今の〜」）
+- 特定の事実確認（「〜は本当？」「〜の価格は？」「〜の発売日は？」）
+- リアルタイム情報（株価、天気、スポーツ結果など）
+- 特定の人物、企業、製品に関する最新情報
+
+【検索が不要な例】
+- 一般的な知識（「Pythonとは」「関数の書き方」）
+- 創作・アイデア出し（「記事を書いて」「企画を考えて」）
+- コード作成・修正依頼
+- 過去の一般的な歴史的事実
+- 意見や提案を求める質問
+
+【回答フォーマット】
+必ず以下のJSON形式で回答してください。
+
+```json
+{
+  "needs_search": true,
+  "reason": "判断理由を簡潔に",
+  "search_query": "検索するクエリ（needs_searchがtrueの場合のみ）"
+}
+```"""
+
+    prompt = f"""【ユーザーの質問・指示】
+{query}
+
+上記に対して、Web検索が必要かどうか判断してください。"""
+
+    try:
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 300,  # 判断だけなので少なくてOK
+            "temperature": 0.1,
+            "messages": [
+                {"role": "user", "content": f"{system_prompt}\n\n{prompt}"}
+            ]
+        })
+
+        # Claude 3 Haikuを使用（高速・低コスト）
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            body=body
+        )
+
+        response_body = json.loads(response["body"].read())
+        response_text = response_body["content"][0]["text"]
+
+        logger.info(f"[Search Judge] Response: {response_text[:200]}...")
+
+        # JSONをパース
+        import re
+        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_text)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            json_str = response_text
+
+        data = json.loads(json_str)
+        needs_search = data.get("needs_search", False)
+        reason = data.get("reason", "")
+        search_query = data.get("search_query", query) if needs_search else ""
+
+        logger.info(f"[Search Judge] needs_search={needs_search}, reason={reason}")
+
+        return {
+            "needs_search": needs_search,
+            "reason": reason,
+            "search_query": search_query,
+        }
+
+    except Exception as e:
+        logger.error(f"[Search Judge] Error: {e}")
+        # エラー時は検索不要とする（安全側に倒す）
+        return {
+            "needs_search": False,
+            "reason": f"判断中にエラー: {str(e)}",
+            "search_query": "",
+        }
+
+
+# =============================================================================
 # LLMクライアント
 # =============================================================================
 
@@ -92,7 +208,7 @@ def get_llm() -> ChatBedrock:
 # Tavily検索
 # =============================================================================
 
-def search_with_tavily(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+def search_with_tavily(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     """
     Tavily APIで検索を実行
 
@@ -151,10 +267,10 @@ def researcher_node(state: ResearchState) -> Dict[str, Any]:
 
     logger.info(f"[Researcher] Loop {state['loop_count'] + 1}/{MAX_LOOPS}")
 
-    # レート制限回避（2回目以降は15秒待機）
+    # レート制限回避（2回目以降は20秒待機）
     if state["loop_count"] > 0:
-        logger.info("[Researcher] Waiting 15 seconds to avoid rate limit...")
-        time.sleep(15)
+        logger.info("[Researcher] Waiting 20 seconds to avoid rate limit...")
+        time.sleep(20)
 
     llm = get_llm()
 
@@ -258,7 +374,23 @@ def researcher_node(state: ResearchState) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"[Researcher] Error: {e}")
-        # エラー時は現在の収集済み情報を保持して終了
+
+        # エラー時でも、まだ情報がなければ質問をそのまま検索してみる
+        if not state.get("gathered_info"):
+            logger.info("[Researcher] No info yet, attempting direct search...")
+            try:
+                search_results = search_with_tavily(state["question"])
+                if search_results:
+                    return {
+                        "is_sufficient": True,
+                        "loop_count": state["loop_count"] + 1,
+                        "search_queries": state.get("search_queries", []) + [state["question"]],
+                        "gathered_info": search_results,
+                    }
+            except Exception as search_err:
+                logger.error(f"[Researcher] Direct search also failed: {search_err}")
+
+        # それでもダメなら現在の情報で終了
         return {
             "is_sufficient": True,
             "loop_count": state["loop_count"] + 1,
@@ -275,26 +407,39 @@ def writer_node(state: ResearchState) -> Dict[str, Any]:
     """
     import time
 
-    logger.info(f"[Writer] Creating final answer from {len(state['gathered_info'])} sources")
+    gathered_info = state.get("gathered_info", [])
+    logger.info(f"[Writer] Creating final answer from {len(gathered_info)} sources")
 
-    # レート制限回避
-    time.sleep(3)
+    # 情報がない場合はフォールバック回答を返す
+    if not gathered_info:
+        logger.warning("[Writer] No sources available, returning fallback answer")
+        return {
+            "final_answer": f"""申し訳ありませんが、「{state['question']}」に関する情報を収集できませんでした。
+
+**考えられる理由:**
+- API制限により検索が実行できませんでした
+- 検索結果が見つかりませんでした
+
+**代替案:**
+- しばらく時間をおいてから再度お試しください
+- より具体的なキーワードで検索してみてください
+""",
+        }
+
+    # レート制限回避（少し長めに待つ）
+    time.sleep(10)
 
     llm = get_llm()
 
     # 収集した情報をフォーマット
-    sources_text = ""
-    if state["gathered_info"]:
-        sources_list = []
-        for i, info in enumerate(state["gathered_info"], 1):
-            sources_list.append(f"""【情報{i}】
+    sources_list = []
+    for i, info in enumerate(gathered_info, 1):
+        sources_list.append(f"""【情報{i}】
 タイトル: {info['title']}
 URL: {info['url']}
 内容: {info['content']}
 """)
-        sources_text = "\n".join(sources_list)
-    else:
-        sources_text = "情報が収集できませんでした。"
+    sources_text = "\n".join(sources_list)
 
     system_prompt = """あなたは優秀なリサーチライターです。
 収集された情報を元に、ユーザーの質問に対する包括的で正確な回答を作成してください。
@@ -336,8 +481,27 @@ URL: {info['url']}
 
     except Exception as e:
         logger.error(f"[Writer] Error: {e}")
+
+        # エラー時でも検索結果があればフォールバック回答を生成
+        if gathered_info:
+            logger.info("[Writer] Generating fallback answer from search results")
+            sources_summary = []
+            for info in gathered_info[:5]:  # 最大5件
+                sources_summary.append(f"- **{info['title']}**: {info['content'][:200]}... ([出典]({info['url']}))")
+
+            fallback = f"""「{state['question']}」についての検索結果をまとめます。
+
+{chr(10).join(sources_summary)}
+
+---
+*※ AI要約は生成できませんでしたが、上記の検索結果をご参照ください。*
+"""
+            return {
+                "final_answer": fallback,
+            }
+
         return {
-            "final_answer": f"回答の生成中にエラーが発生しました: {str(e)}",
+            "final_answer": f"回答の生成中にエラーが発生しました: {str(e)}\n\nしばらく時間をおいてから再度お試しください。",
         }
 
 
@@ -437,14 +601,16 @@ async def run_deep_research(question: str) -> Dict[str, Any]:
             raise ValueError("Research produced no output")
 
         # 結果を整形
+        gathered_info = accumulated_state.get("gathered_info", [])
         result = {
             "success": True,
             "answer": accumulated_state.get("final_answer", ""),
             "search_queries": accumulated_state.get("search_queries", []),
             "sources": [
                 {"title": info["title"], "url": info["url"]}
-                for info in accumulated_state.get("gathered_info", [])
+                for info in gathered_info
             ],
+            "gathered_info": gathered_info,  # 検索結果の詳細情報も返す
             "loop_count": accumulated_state.get("loop_count", 0),
             "error": None,
         }

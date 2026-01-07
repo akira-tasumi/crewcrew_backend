@@ -11,13 +11,13 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# AWS設定
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
-MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+# AWS設定（クロスリージョン推論）
+AWS_REGION = "us-east-1"  # クロスリージョン推論はus-east-1から呼び出し
+MODEL_ID = "us.anthropic.claude-3-5-sonnet-20240620-v1:0"  # USクロスリージョン推論ID
 
 # リトライ設定
-MAX_RETRIES = 3
-INITIAL_BACKOFF = 2  # 初回待機時間（秒）
+MAX_RETRIES = 5  # リトライ回数を増加
+INITIAL_BACKOFF = 5  # 初回待機時間（秒）を増加
 
 # クルー別のシステムプロンプト定義
 # 各クルーの性格・口調・役割を厳密に定義
@@ -166,6 +166,7 @@ async def execute_task_with_crew(
     crew_role: str,
     personality: str,
     task: str,
+    auto_search: bool = True,
 ) -> dict:
     """
     クルーの性格を反映してタスクを実行（Bedrock API呼び出し）
@@ -174,20 +175,89 @@ async def execute_task_with_crew(
     コード側での語尾追加や定型文の結合は一切行わない。
     レート制限時は自動リトライ（指数バックオフ）を行う。
 
+    自動検索機能：
+    - auto_search=Trueの場合、AIが検索が必要と判断すれば自動でDeep Researchを実行
+    - 検索結果を元に回答を生成
+
     Args:
         crew_name: クルーの名前
         crew_role: クルーの役割（未使用、システムプロンプトで定義済み）
         personality: クルーの性格設定（未使用、システムプロンプトで定義済み）
         task: ユーザーからの依頼内容
+        auto_search: 自動検索を有効にするか（デフォルトTrue）
 
     Returns:
         dict: {
             "success": bool,
             "result": str,  # AIが生成したテキストをそのまま返す
-            "error": str | None
+            "error": str | None,
+            "searched": bool,  # 検索が実行されたか
+            "sources": list | None,  # 検索された場合の情報源
         }
     """
     client = get_bedrock_client()
+
+    # 自動検索の判断と実行
+    search_context = ""
+    searched = False
+    sources = None
+
+    if auto_search:
+        try:
+            from graphs import should_search, run_deep_research
+            import asyncio
+            import time
+
+            # 検索が必要か判断
+            search_judgment = should_search(task)
+
+            if search_judgment.get("needs_search", False):
+                logger.info(f"[Auto Search] Search needed: {search_judgment.get('reason')}")
+
+                # レート制限回避のため待機
+                await asyncio.sleep(5)
+
+                # Deep Researchを実行
+                search_query = search_judgment.get("search_query", task)
+                research_result = await run_deep_research(search_query)
+
+                gathered_info = research_result.get("gathered_info", [])
+                logger.info(f"[Auto Search] Research result: success={research_result.get('success')}, gathered_info={len(gathered_info)} items")
+
+                if research_result.get("success") and gathered_info:
+                    searched = True
+                    sources = research_result.get("sources", [])
+
+                    # 検索結果をコンテキストとして追加（詳細に）
+                    info_texts = []
+                    for i, info in enumerate(gathered_info[:10], 1):  # 最大10件
+                        title = info.get('title', '')
+                        content = info.get('content', '')[:800]  # 800文字まで拡大
+                        url = info.get('url', '')
+                        info_texts.append(f"""
+【情報{i}】{title}
+{content}
+出典: {url}
+""")
+
+                    search_context = f"""
+
+=== 検索で得られた最新情報 ===
+{chr(10).join(info_texts)}
+
+【重要な指示】
+- 上記の検索結果に含まれる具体的な情報（人名、数値、事実など）を**省略せずに**回答に含めてください
+- ユーザーが「すべて」「全員」などを求めている場合は、検索結果に含まれる情報を可能な限り列挙してください
+- 情報源のURLを回答の最後に記載してください
+"""
+                    logger.info(f"[Auto Search] Got {len(sources)} sources")
+
+                    # 回答生成前に待機（レート制限回避）
+                    logger.info("[Auto Search] Waiting 20 seconds before response generation...")
+                    await asyncio.sleep(20)
+        except Exception as e:
+            logger.error(f"[Auto Search] Error: {e}")
+            # エラー時は検索なしで続行
 
     # 既存クルーはCREW_PROMPTSを優先、新規クルーはpersonalityを使用
     if crew_name in CREW_PROMPTS:
@@ -206,6 +276,9 @@ async def execute_task_with_crew(
 - キャラクターの性格・口調を必ず守る
 - 最後に必ずキャラクターらしい「締めの一言」で会話を終える"""
 
+    # タスクに検索コンテキストを追加
+    full_task = task + search_context
+
     # Claude 3.5 Sonnet へのリクエストボディ
     request_body = {
         "anthropic_version": "bedrock-2023-05-31",
@@ -214,7 +287,7 @@ async def execute_task_with_crew(
         "messages": [
             {
                 "role": "user",
-                "content": task,
+                "content": full_task,
             }
         ],
         "temperature": 0.7,
@@ -243,6 +316,8 @@ async def execute_task_with_crew(
                 "success": True,
                 "result": result_text,
                 "error": None,
+                "searched": searched,
+                "sources": sources,
             }
 
         except ClientError as e:
@@ -262,6 +337,8 @@ async def execute_task_with_crew(
                     "success": False,
                     "result": None,
                     "error": str(e),
+                    "searched": searched,
+                    "sources": sources,
                 }
 
         except Exception as e:
@@ -270,6 +347,8 @@ async def execute_task_with_crew(
                 "success": False,
                 "result": None,
                 "error": str(e),
+                "searched": searched,
+                "sources": sources,
             }
 
     # 全リトライ失敗
@@ -278,6 +357,8 @@ async def execute_task_with_crew(
         "success": False,
         "result": None,
         "error": "リクエストが混雑しています。しばらく待ってから再度お試しください。",
+        "searched": searched,
+        "sources": sources,
     }
 
 

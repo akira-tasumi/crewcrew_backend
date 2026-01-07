@@ -22,9 +22,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# AWS設定
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
-MODEL_ID = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+# AWS設定（クロスリージョン推論）
+AWS_REGION = "us-east-1"  # クロスリージョン推論はus-east-1から呼び出し
+MODEL_ID = "us.anthropic.claude-3-5-sonnet-20240620-v1:0"  # USクロスリージョン推論ID
 
 # クルー別のシステムプロンプト（bedrock_service.pyから転用）
 CREW_PROMPTS: Dict[str, str] = {
@@ -212,12 +212,13 @@ def generator_node(state: DirectorState) -> Dict[str, Any]:
         更新された状態の部分辞書
     """
     import time
+    import random
 
     logger.info(f"[Generator] Starting generation. Revision count: {state['revision_count']}")
 
-    # 修正ループ時は待機してレート制限を回避（3秒に増加）
+    # 修正ループ時は待機してレート制限を回避（5秒に増加）
     if state["revision_count"] > 0:
-        time.sleep(3)
+        time.sleep(5)
 
     llm = get_llm()
 
@@ -250,33 +251,44 @@ def generator_node(state: DirectorState) -> Dict[str, Any]:
         HumanMessage(content=user_content),
     ]
 
-    try:
-        response = llm.invoke(messages)
-        draft = response.content
+    # リトライ付きで実行（Throttlingエラー対策）
+    max_retries = 3
+    last_error = None
 
-        logger.info(f"[Generator] Generated draft: {len(draft)} characters")
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                # 指数バックオフ: 30秒、60秒、120秒
+                wait_time = 30 * (2 ** attempt) + random.uniform(0, 10)
+                logger.warning(f"[Generator] Retry {attempt + 1}/{max_retries}, waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
 
-        return {
-            "draft": draft,
-            "revision_count": state["revision_count"] + 1,
-            "messages": [
-                HumanMessage(content=user_content),
-                AIMessage(content=draft),
-            ],
-        }
+            response = llm.invoke(messages)
+            draft = response.content
 
-    except Exception as e:
-        logger.error(f"[Generator] Error: {e}")
-        error_msg = f"エラーが発生しました: {str(e)}"
-        # エラー時は前回のdraftがあればそれを使用、なければエラーメッセージ
-        final_draft = state.get("draft", "") or error_msg
-        return {
-            "draft": error_msg,
-            "revision_count": state["revision_count"] + 1,
-            "score": 50,  # エラー時は50点（評価なし）
-            "is_complete": True,
-            "final_result": final_draft,  # 前回の成果物を保持
-        }
+            logger.info(f"[Generator] Generated draft: {len(draft)} characters")
+
+            return {
+                "draft": draft,
+                "revision_count": state["revision_count"] + 1,
+                "messages": [
+                    HumanMessage(content=user_content),
+                    AIMessage(content=draft),
+                ],
+            }
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            logger.error(f"[Generator] Error (attempt {attempt + 1}): {e}")
+
+            # Throttlingエラーの場合のみリトライ
+            if "ThrottlingException" not in error_str and "Too many requests" not in error_str:
+                raise
+
+    # 全リトライ失敗
+    logger.error(f"[Generator] All retries failed: {last_error}")
+    raise last_error
 
 
 def reflector_node(state: DirectorState) -> Dict[str, Any]:
@@ -441,3 +453,147 @@ def parse_evaluation_response(response_text: str) -> tuple[int, str]:
         critique = critique_match.group(1).strip() if critique_match else response_text[:500]
 
         return score, critique
+
+
+# =============================================================================
+# Human-in-the-loop用ノード
+# =============================================================================
+
+def human_review_node(state: DirectorState) -> Dict[str, Any]:
+    """
+    人間のレビューを待つノード（Human-in-the-loop）
+
+    このノードは `interrupt_before` で設定され、
+    外部出力（Slides/Sheets/Slack等）を作成する前に一時停止する。
+
+    フロー:
+    1. 成果物が完成したらこのノードで停止
+    2. 承認待ち状態をDBに保存（approval_request_id を設定）
+    3. フロントエンドに通知
+    4. ユーザーが承認/却下/修正すると、ワークフローが再開
+
+    Args:
+        state: 現在の状態
+
+    Returns:
+        更新された状態の部分辞書
+    """
+    logger.info(f"[HumanReview] Entering review node. requires_approval={state.get('requires_approval')}")
+
+    # 承認フローが無効な場合はスキップ
+    if not state.get("requires_approval", False):
+        logger.info("[HumanReview] Approval not required, skipping review")
+        return {
+            "approval_status": "approved",
+            "pending_output": state.get("final_result") or state.get("draft", ""),
+        }
+
+    # 既に承認済みの場合（再開時）
+    if state.get("approval_status") == "approved":
+        logger.info("[HumanReview] Already approved, proceeding to output")
+        return {}
+
+    # 却下された場合
+    if state.get("approval_status") == "rejected":
+        logger.info("[HumanReview] Rejected by user, ending workflow")
+        return {
+            "is_complete": True,
+        }
+
+    # 修正が入った場合
+    if state.get("approval_status") == "modified" and state.get("human_feedback"):
+        logger.info("[HumanReview] Modified by user, applying feedback")
+        # 修正内容を反映（ここでは単純に置き換え）
+        return {
+            "pending_output": state.get("human_feedback"),
+            "approval_status": "approved",
+        }
+
+    # 承認待ち状態に設定
+    logger.info(f"[HumanReview] Setting pending approval. thread_id={state.get('thread_id')}")
+    return {
+        "approval_status": "pending",
+        "pending_output": state.get("final_result") or state.get("draft", ""),
+    }
+
+
+def output_creation_node(state: DirectorState) -> Dict[str, Any]:
+    """
+    外部出力を作成するノード
+
+    承認後にのみ実行され、Google Slides / Sheets / Slack等への出力を行う。
+    実際の出力処理はこのノード内では行わず、状態を更新するのみ。
+    出力処理はワークフロー完了後にmain.pyで実行される。
+
+    Args:
+        state: 現在の状態
+
+    Returns:
+        更新された状態の部分辞書
+    """
+    logger.info(f"[OutputCreation] Creating output. type={state.get('output_type')}, status={state.get('approval_status')}")
+
+    # 承認されていない場合はスキップ
+    if state.get("approval_status") != "approved":
+        logger.warning(f"[OutputCreation] Not approved, skipping output creation")
+        return {
+            "is_complete": True,
+        }
+
+    output_type = state.get("output_type", "none")
+    pending_output = state.get("pending_output") or state.get("final_result") or state.get("draft", "")
+
+    if output_type == "none":
+        logger.info("[OutputCreation] No output type specified, completing workflow")
+        return {
+            "is_complete": True,
+            "final_result": pending_output,
+        }
+
+    # 出力準備完了を記録（実際の出力はワークフロー完了後に実行）
+    logger.info(f"[OutputCreation] Output ready for creation. type={output_type}, length={len(pending_output)}")
+
+    return {
+        "is_complete": True,
+        "final_result": pending_output,
+    }
+
+
+def run_generator_only(state: DirectorState) -> Dict[str, Any]:
+    """
+    Generatorのみを実行する同期関数（バックグラウンド実行用）
+
+    Reflectorを使わず、Generatorの出力をそのまま返す。
+    これによりAPIコール数を大幅に削減。
+
+    Args:
+        state: DirectorState初期状態
+
+    Returns:
+        実行結果を含む辞書
+    """
+    try:
+        # Generatorを実行
+        result = generator_node(state)
+
+        draft = result.get("draft", "")
+        revision_count = result.get("revision_count", 1)
+
+        return {
+            "success": True,
+            "result": draft,
+            "score": 100,  # Reflectorなしなので自動合格
+            "revision_count": revision_count,
+            "crew_name": state.get("crew_name", ""),
+        }
+
+    except Exception as e:
+        logger.error(f"[GeneratorOnly] Error: {e}")
+        return {
+            "success": False,
+            "result": "",
+            "score": 0,
+            "revision_count": 0,
+            "crew_name": state.get("crew_name", ""),
+            "error": str(e),
+        }
